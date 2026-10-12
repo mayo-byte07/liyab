@@ -1,0 +1,575 @@
+// The conversation: the living flame at rest in an empty chat, then the
+// messages; a composer with the flame's lit edge while the model works.
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+
+import '../state/app_state.dart';
+import '../ui/app_drawer.dart';
+import '../ui/ember_edge.dart';
+import '../ui/living_flame.dart';
+import '../ui/waking_up.dart';
+import '../ui/theme.dart';
+import 'model_sheet.dart';
+
+class ChatScreen extends StatefulWidget {
+  const ChatScreen({super.key, required this.app, this.onCollapse});
+  final AppState app;
+
+  /// Set when the chat fills the assistant sheet: shrinks it back to the sheet.
+  final VoidCallback? onCollapse;
+
+  @override
+  State<ChatScreen> createState() => _ChatScreenState();
+}
+
+class _ChatScreenState extends State<ChatScreen> {
+  final _input = TextEditingController();
+  final _scroll = ScrollController();
+  final _focus = FocusNode();
+
+  AppState get app => widget.app;
+
+  @override
+  void initState() {
+    super.initState();
+    app.addListener(_changed);
+    app.monitor.addListener(_heatChanged);
+    _input.addListener(_typed);
+  }
+
+  /// The engine processes the draft while the user writes (AppState.draftChanged).
+  void _typed() => app.draftChanged(_input.text);
+
+  void _heatChanged() {
+    if (mounted) setState(() {});
+  }
+
+  @override
+  void dispose() {
+    app.removeListener(_changed);
+    app.monitor.removeListener(_heatChanged);
+    _input.dispose();
+    _scroll.dispose();
+    _focus.dispose();
+    super.dispose();
+  }
+
+  void _changed() {
+    setState(() {});
+    // Follow the reply while it streams, unless the reader scrolled up.
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (_scroll.hasClients && _scroll.position.extentAfter < 120) {
+        _scroll.jumpTo(_scroll.position.maxScrollExtent);
+      }
+    });
+  }
+
+  void _send([String? text]) {
+    final t = (text ?? _input.text).trim();
+    if (t.isEmpty) return;
+    HapticFeedback.lightImpact();
+    _input.clear();
+    app.send(t);
+  }
+
+  FlameState get _flameState {
+    if (!app.generating || app.messages.isEmpty) return FlameState.resting;
+    final m = app.messages.last;
+    return m.raw.isEmpty || m.thinkingNow ? FlameState.thinking : FlameState.answering;
+  }
+
+  /// The phone's thermal headroom (Android's 10 s forecast), shown as the flame's colour.
+  double get _heat => app.monitor.heat;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return Scaffold(
+      drawer: AppDrawer(app: app),
+      appBar: AppBar(
+        titleSpacing: 0,
+        title: InkWell(
+          borderRadius: BorderRadius.circular(12),
+          onTap: () => showModelSheet(context, app),
+          child: Padding(
+            padding: const EdgeInsets.symmetric(vertical: 6, horizontal: 4),
+            child: Row(
+              children: [
+                LivingFlame(size: 34, state: _flameState, heat: _heat),
+                const SizedBox(width: 10),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text('Liyab', style: theme.textTheme.titleLarge),
+                      Text(
+                        app.loading ? app.status : (app.modelName.isEmpty ? 'Choose a model' : app.modelName),
+                        style: theme.textTheme.labelSmall,
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                    ],
+                  ),
+                ),
+                Icon(Icons.expand_more, color: theme.colorScheme.onSurfaceVariant, size: 20),
+              ],
+            ),
+          ),
+        ),
+        actions: [
+          IconButton(
+            tooltip: 'New chat',
+            onPressed: app.messages.isEmpty || app.generating ? null : app.newChat,
+            icon: const Icon(Icons.edit_note_rounded),
+          ),
+          if (widget.onCollapse != null)
+            IconButton(
+              tooltip: 'Show as a sheet',
+              onPressed: widget.onCollapse,
+              icon: const Icon(Icons.close_fullscreen_rounded),
+            ),
+          const SizedBox(width: 4),
+        ],
+      ),
+      body: Column(
+        children: [
+          Expanded(
+            child: Stack(
+              children: [
+                Positioned.fill(
+                  child: AnimatedSwitcher(
+                    duration: const Duration(milliseconds: 350),
+                    child: app.messages.isEmpty
+                        ? _EmptyChat(app: app, onSuggestion: _send, flameState: _flameState, heat: _heat)
+                        : ListView.builder(
+                            key: const ValueKey('messages'),
+                            controller: _scroll,
+                            padding: const EdgeInsets.fromLTRB(16, 8, 16, 24),
+                            itemCount: app.messages.length,
+                            itemBuilder: (context, i) => i > 0 && i == app.historyStart
+                                ? Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+                                    const _ContextCut(),
+                                    MessageView(message: app.messages[i]),
+                                  ])
+                                : MessageView(message: app.messages[i]),
+                          ),
+                  ),
+                ),
+                // Over a conversation while the model loads (the empty chat shows its own flame).
+                Positioned.fill(
+                  child: AnimatedSwitcher(
+                    duration: const Duration(milliseconds: 300),
+                    child: app.loading && app.messages.isNotEmpty
+                        ? ColoredBox(
+                            key: const ValueKey('waking'),
+                            color: Theme.of(context).colorScheme.surface.withValues(alpha: 0.9),
+                            child: WakingUp(status: app.status, heat: _heat),
+                          )
+                        : const SizedBox.shrink(),
+                  ),
+                ),
+              ],
+            ),
+          ),
+          _Composer(
+            controller: _input,
+            focus: _focus,
+            enabled: app.modelPath != null && !app.loading,
+            generating: app.generating,
+            onSend: _send,
+            onStop: app.stop,
+            flameState: _flameState,
+            heat: _heat,
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _EmptyChat extends StatelessWidget {
+  const _EmptyChat({required this.app, required this.onSuggestion, required this.flameState, required this.heat});
+  final AppState app;
+  final void Function(String) onSuggestion;
+  final FlameState flameState;
+  final double heat;
+
+  static const _suggestions = [
+    'Explain how a refrigerator works',
+    'Write a short poem about the sea',
+    'Plan a three-day trip to Rome',
+  ];
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final ready = app.modelPath != null && !app.loading;
+    return Center(
+      key: const ValueKey('empty'),
+      child: SingleChildScrollView(
+        padding: const EdgeInsets.symmetric(horizontal: 24),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            LivingFlame(size: 168, state: app.loading ? FlameState.thinking : flameState, heat: heat),
+            const SizedBox(height: 8),
+            Text(
+              ready ? 'How can I help?' : (app.loading ? 'Waking up' : 'Choose a model to begin'),
+              style: theme.textTheme.headlineMedium,
+              textAlign: TextAlign.center,
+            ),
+            const SizedBox(height: 6),
+            Text(
+              ready ? 'Runs on this phone. Nothing you write leaves it.' : app.status,
+              style: theme.textTheme.bodyMedium?.copyWith(color: theme.colorScheme.onSurfaceVariant),
+              textAlign: TextAlign.center,
+            ),
+            const SizedBox(height: 24),
+            if (ready)
+              Wrap(
+                alignment: WrapAlignment.center,
+                spacing: 8,
+                runSpacing: 8,
+                children: [
+                  for (final s in _suggestions)
+                    ActionChip(
+                      label: Text(s),
+                      onPressed: () => onSuggestion(s),
+                      backgroundColor: theme.colorScheme.surfaceContainerHighest,
+                      side: BorderSide(color: theme.colorScheme.outline),
+                      shape: const StadiumBorder(),
+                    ),
+                ],
+              )
+            else if (!app.loading)
+              FilledButton.icon(
+                onPressed: () => showModelSheet(context, app),
+                icon: const Icon(Icons.folder_open_rounded),
+                label: const Text('Choose a model'),
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+/// One exchange: the user's message as a pill, then the reply (and its reasoning) as text.
+class MessageView extends StatelessWidget {
+  const MessageView({super.key, required this.message});
+  final ChatMessage message;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final reasoning = message.reasoning;
+    final stats = message.stats;
+    return TweenAnimationBuilder<double>(
+      tween: Tween(begin: 0, end: 1),
+      duration: const Duration(milliseconds: 320),
+      curve: Curves.easeOutCubic,
+      builder: (context, v, child) => Opacity(
+        opacity: v,
+        child: Transform.translate(offset: Offset(0, (1 - v) * 12), child: child),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          const SizedBox(height: 16),
+          // The user's message: a pill on the right.
+          Align(
+            alignment: Alignment.centerRight,
+            child: ConstrainedBox(
+              constraints: BoxConstraints(maxWidth: MediaQuery.sizeOf(context).width * 0.8),
+              child: Container(
+                padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+                decoration: BoxDecoration(
+                  color: theme.colorScheme.surfaceContainerHighest,
+                  borderRadius: BorderRadius.circular(22),
+                ),
+                child: SelectableText(message.user, style: theme.textTheme.bodyLarge),
+              ),
+            ),
+          ),
+          const SizedBox(height: 14),
+          // The tools the reply used, e.g. "Read your calendar: 3 events".
+          for (final step in message.steps)
+            Padding(
+              padding: const EdgeInsets.only(bottom: 8),
+              child: Row(children: [
+                Icon(Icons.auto_awesome_outlined, size: 16, color: theme.colorScheme.primary),
+                const SizedBox(width: 6),
+                Flexible(
+                  child: Text('${step.label}: ${step.summary}',
+                      style: theme.textTheme.labelSmall?.copyWith(color: theme.colorScheme.onSurfaceVariant)),
+                ),
+              ]),
+            ),
+          if (reasoning != null) _Reasoning(text: reasoning, active: message.thinkingNow),
+          // The reply: plain text, full width, like a page.
+          if (message.answer.isNotEmpty || (message.streaming && reasoning == null))
+            AnimatedSize(
+              duration: const Duration(milliseconds: 120),
+              alignment: Alignment.topLeft,
+              child: SelectableText.rich(
+                TextSpan(
+                  children: [
+                    TextSpan(text: message.answer),
+                    if (message.streaming && !message.thinkingNow)
+                      const WidgetSpan(alignment: PlaceholderAlignment.middle, child: _Caret()),
+                  ],
+                ),
+                style: theme.textTheme.bodyLarge,
+              ),
+            ),
+          if (message.error != null)
+            Padding(
+              padding: const EdgeInsets.only(top: 8),
+              child: Text(
+                'The reply stopped: ${message.error}',
+                style: theme.textTheme.bodyMedium?.copyWith(color: theme.colorScheme.error),
+              ),
+            ),
+          if (stats != null)
+            Padding(
+              padding: const EdgeInsets.only(top: 8),
+              child: Text(
+                '${stats.generatedTokens} tokens, ${stats.tokensPerSecond.toStringAsFixed(1)} tok/s, '
+                'first token ${(stats.ttftMs / 1000).toStringAsFixed(2)} s, '
+                '${stats.cachedPrefixTokens} of ${stats.promptTokens} prompt tokens reused'
+                '${stats.thermalReroutes > 0 ? ', cooling down' : ''}'
+                '${stats.cancelled ? ', stopped' : ''}',
+                style: theme.textTheme.labelSmall,
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+}
+
+/// The model's reasoning, folded under one line once it is done.
+class _Reasoning extends StatefulWidget {
+  const _Reasoning({required this.text, required this.active});
+  final String text;
+  final bool active;
+
+  @override
+  State<_Reasoning> createState() => _ReasoningState();
+}
+
+class _ReasoningState extends State<_Reasoning> {
+  bool _open = false;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final muted = theme.textTheme.bodyMedium?.copyWith(color: theme.colorScheme.onSurfaceVariant);
+    final show = widget.active || _open;
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 10),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          InkWell(
+            borderRadius: BorderRadius.circular(8),
+            onTap: widget.active ? null : () => setState(() => _open = !_open),
+            child: Padding(
+              padding: const EdgeInsets.symmetric(vertical: 4),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Text(widget.active ? 'Thinking' : 'Reasoning', style: muted?.copyWith(fontWeight: FontWeight.w600)),
+                  if (!widget.active) Icon(show ? Icons.expand_less : Icons.expand_more, size: 18, color: muted?.color),
+                ],
+              ),
+            ),
+          ),
+          AnimatedSize(
+            duration: const Duration(milliseconds: 220),
+            alignment: Alignment.topLeft,
+            child: show
+                ? Container(
+                    padding: const EdgeInsets.only(left: 12),
+                    decoration: BoxDecoration(
+                      border: Border(left: BorderSide(color: theme.colorScheme.outline, width: 2)),
+                    ),
+                    child: Text(widget.text, style: muted),
+                  )
+                : const SizedBox(width: double.infinity),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+/// A soft ember dot at the end of a streaming reply.
+class _Caret extends StatefulWidget {
+  const _Caret();
+  @override
+  State<_Caret> createState() => _CaretState();
+}
+
+class _CaretState extends State<_Caret> with SingleTickerProviderStateMixin {
+  late final AnimationController _c = AnimationController(vsync: this, duration: const Duration(milliseconds: 900))
+    ..repeat(reverse: true);
+
+  @override
+  void dispose() {
+    _c.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) => FadeTransition(
+    opacity: Tween(begin: 0.35, end: 1.0).animate(_c),
+    child: Container(
+      width: 9,
+      height: 9,
+      margin: const EdgeInsets.only(left: 4),
+      decoration: const BoxDecoration(
+        shape: BoxShape.circle,
+        gradient: LinearGradient(colors: [Palette.flare, Palette.gold]),
+      ),
+    ),
+  );
+}
+
+class _Composer extends StatelessWidget {
+  const _Composer({
+    required this.controller,
+    required this.focus,
+    required this.enabled,
+    required this.generating,
+    required this.onSend,
+    required this.onStop,
+    required this.flameState,
+    required this.heat,
+  });
+
+  final FlameState flameState;
+  final double heat;
+  final TextEditingController controller;
+  final FocusNode focus;
+  final bool enabled;
+  final bool generating;
+  final void Function([String?]) onSend;
+  final VoidCallback onStop;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    // While the model works the bar has the assistant sheet's lit edge.
+    return SafeArea(
+      top: false,
+      minimum: const EdgeInsets.fromLTRB(12, 6, 12, 10),
+      child: EmberEdge(
+        state: flameState,
+        heat: heat,
+        borderRadius: BorderRadius.circular(28),
+        child: Container(
+          padding: const EdgeInsets.fromLTRB(18, 4, 6, 4),
+          decoration: BoxDecoration(
+            color: theme.colorScheme.surfaceContainerHighest,
+            borderRadius: BorderRadius.circular(28),
+            border: Border.all(color: theme.colorScheme.outline),
+          ),
+          child: Row(
+            crossAxisAlignment: CrossAxisAlignment.end,
+            children: [
+              Expanded(
+                child: TextField(
+                  controller: controller,
+                  focusNode: focus,
+                  enabled: enabled,
+                  minLines: 1,
+                  maxLines: 6,
+                  textCapitalization: TextCapitalization.sentences,
+                  style: theme.textTheme.bodyLarge,
+                  decoration: InputDecoration(
+                    hintText: enabled ? 'Ask Liyab' : 'Load a model first',
+                    border: InputBorder.none,
+                    isDense: true,
+                    contentPadding: const EdgeInsets.symmetric(vertical: 12),
+                  ),
+                  onSubmitted: enabled && !generating ? (_) => onSend() : null,
+                ),
+              ),
+              const SizedBox(width: 6),
+              Padding(
+                padding: const EdgeInsets.only(bottom: 2),
+                child: RoundAction(
+                  tooltip: generating ? 'Stop' : 'Send',
+                  icon: generating ? Icons.stop_rounded : Icons.arrow_upward_rounded,
+                  onPressed: !enabled ? null : (generating ? onStop : () => onSend()),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+/// The round send / stop button in the flame's gradient (docs/brand).
+class RoundAction extends StatelessWidget {
+  const RoundAction({super.key, required this.tooltip, required this.icon, required this.onPressed});
+  final String tooltip;
+  final IconData icon;
+  final VoidCallback? onPressed;
+
+  @override
+  Widget build(BuildContext context) => Tooltip(
+    message: tooltip,
+    child: AnimatedOpacity(
+      opacity: onPressed == null ? 0.4 : 1,
+      duration: const Duration(milliseconds: 200),
+      child: Material(
+        shape: const CircleBorder(),
+        clipBehavior: Clip.antiAlias,
+        child: Ink(
+          width: 44,
+          height: 44,
+          decoration: const BoxDecoration(
+            gradient: LinearGradient(
+              begin: Alignment.bottomLeft,
+              end: Alignment.topRight,
+              colors: [Palette.flare, Palette.ember],
+            ),
+          ),
+          child: InkWell(
+            onTap: onPressed,
+            child: AnimatedSwitcher(
+              duration: const Duration(milliseconds: 180),
+              transitionBuilder: (c, a) => ScaleTransition(scale: a, child: c),
+              child: Icon(icon, key: ValueKey(icon), color: Colors.white),
+            ),
+          ),
+        ),
+      ),
+    ),
+  );
+}
+
+/// Where the conversation was compacted: the messages above are no longer in the model's context.
+class _ContextCut extends StatelessWidget {
+  const _ContextCut();
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final style = theme.textTheme.labelSmall?.copyWith(color: theme.colorScheme.onSurfaceVariant);
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 12),
+      child: Row(children: [
+        const Expanded(child: Divider()),
+        Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 8),
+          child: Text('Earlier messages are no longer in Liyab\'s memory', style: style),
+        ),
+        const Expanded(child: Divider()),
+      ]),
+    );
+  }
+}

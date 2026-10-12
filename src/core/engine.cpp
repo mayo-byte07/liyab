@@ -1,0 +1,1480 @@
+#include "liyab/engine.h"
+
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cmath>
+#include <cstdio>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <functional>
+#include <mutex>
+#include <sstream>
+
+#include <unistd.h>
+
+#include "core/log.h"
+#include "core/quant.h"
+#include "core/sampling.h"
+#include "core/thread_pool.h"
+#include "core/tokenizer.h"
+#include "core/direct_io.h"
+#include "core/transformer.h"
+#include "liyab/backend.h"
+#include "liyab/mmap_loader.h"
+#include "liyab/speculative_decoder.h"
+
+#include "liyab/triple_buffer_loader.h"
+
+#if defined(LIYAB_ENABLE_EXPERIMENTAL)
+#include "liyab/experimental/early_exit.h"
+#include "liyab/experimental/egls.h"
+#include "liyab/experimental/tdss.h"
+#include "liyab/experimental/kv_dedup.h"
+#include "liyab/experimental/head_pruner.h"
+#endif
+
+namespace liyab {
+
+namespace {
+
+using Clock = std::chrono::steady_clock;
+
+double ms_since(Clock::time_point start) {
+    return std::chrono::duration<double, std::milli>(Clock::now() - start).count();
+}
+
+// Length of the longest prefix of `s` that ends on a UTF-8 character
+// boundary, so callers (Swift String, Kotlin String) never see half a glyph.
+size_t complete_utf8_prefix(std::string_view s) {
+    const size_t n = s.size();
+    for (size_t back = 1; back <= std::min<size_t>(4, n); ++back) {
+        const auto c = static_cast<unsigned char>(s[n - back]);
+        if ((c & 0xC0) == 0x80) continue;  // continuation byte: keep looking for the lead
+        size_t need = 1;
+        if ((c & 0xE0) == 0xC0) need = 2;
+        else if ((c & 0xF0) == 0xE0) need = 3;
+        else if ((c & 0xF8) == 0xF0) need = 4;
+        return back >= need ? n : n - back;
+    }
+    return n;  // only continuation bytes: malformed input, pass it through
+}
+
+// `repack_cpu`: the CPU computes every block (no GPU / NPU route), so its
+// i8mm kernels may get their own weight layout (TransformerOptions::repack_cpu).
+Result<std::unique_ptr<Transformer>> load_model(const std::string& path, const EngineConfig& config,
+                                                int32_t max_batch, bool repack_cpu) {
+    LoaderOptions loader_options;
+    loader_options.streaming = config.streaming;
+    // The prefix cache comes out of the memory budget: set aside when deciding
+    // whether the model fits, and on a MoE whose experts stream, taken only
+    // from what the expert cache can spare (TransformerOptions::reserve_bytes).
+    const int64_t budget_mb = std::max<int64_t>(config.memory_budget_mb, 0);
+    const int64_t reserve_mb = std::min(std::max<int64_t>(config.prefix_cache_mb, 0), budget_mb / 2);
+    loader_options.memory_budget_bytes = static_cast<uint64_t>(budget_mb - reserve_mb) << 20;
+    auto file = MmapLoader::open(path, loader_options);
+    if (!file) return file.status();
+    TransformerOptions options;
+    options.context_length = config.context_length;
+    options.sliding_window = config.sliding_window;
+    options.sink_tokens = config.kv_sink_tokens;
+    options.kv_type = config.kv_cache_type;
+    options.max_batch = max_batch;
+    options.expert_cache_bytes = config.expert_cache_mb > 0 ? config.expert_cache_mb << 20 : config.expert_cache_mb;
+    options.memory_budget_bytes = loader_options.memory_budget_bytes;
+    options.reserve_bytes = static_cast<size_t>(reserve_mb) << 20;
+    options.requant_bits = config.requant_bits;
+    options.expert_mass = config.moe_expert_mass;
+    options.max_experts = config.moe_max_experts;
+    options.skip_slow = config.moe_skip_slow;
+    options.repack_cpu = repack_cpu && !config.triple_buffer_loading;
+    return Transformer::load(std::move(file).value(), options);
+}
+
+}  // namespace
+
+struct Engine::Impl {
+    EngineConfig config;
+    DeviceInfo device;
+    std::unique_ptr<ThreadPool> pool;
+    std::unique_ptr<Backend> cpu;
+    std::unique_ptr<Backend> gpu;  // Metal today; Vulkan once implemented
+    std::unique_ptr<Backend> npu;  // QNN / NeuroPilot once implemented
+    std::unique_ptr<Transformer> target;
+    std::unique_ptr<Transformer> draft;
+    std::unique_ptr<DirectFile> direct_file;  // must outlive weight_loader
+    std::atomic<uint64_t> tokens_generated{0};  // Engine::counters()
+    // Tokens whose KV / recurrent state the target holds, in order
+    // (target->n_past() == context.size()); context lookup drafts from it. Not
+    // used with a draft model, whose cache moves in step with the target's
+    // during speculation.
+    std::vector<int32_t> context;
+    // The text the first `context_text_tokens` tokens of `context` encode (0:
+    // not known): a prompt given as text, followed by the pieces of the reply
+    // tokens generated after it. Those tokens need not be the text's own
+    // encoding (a model may write a word in pieces the tokenizer would
+    // merge), so a prompt is matched against this text, not re-encoded
+    // (encode_continuation). The text outlives work that was cancelled or cut
+    // short, which leaves its tokens in place, and follows rewinds
+    // (cut_text): losing it made the next turn re-encode the conversation,
+    // diverge at the first such reply and, on a hybrid model, start over.
+    std::string context_text;
+    size_t context_text_tokens = 0;
+
+    void clear_context() {
+        target->reset();
+        if (draft) draft->reset();
+        context.clear();
+        context_text.clear();
+        context_text_tokens = 0;
+    }
+
+    // Moves `end` back over the text that context[i] stands for at the end
+    // of text[0, end): a prompt's tokens as encode() matched them (a special
+    // token's own text, such as a chat template's "<|im_end|>"), a reply's as
+    // their pieces (a special one generated decodes to ""). False when the
+    // text does not end with the token's.
+    bool step_back(std::string_view text, size_t& end, size_t i) const {
+        const int32_t id = context[i];
+        const bool segment_start = i == 0 || tokenizer->is_special(context[i - 1]);
+        for (const std::string_view t : {tokenizer->prompt_text(id, segment_start), std::string_view(tokenizer->piece(id))}) {
+            if (t.size() <= end && text.substr(end - t.size(), t.size()) == t) {
+                end -= t.size();
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // Before `context` is cut to its first `n` tokens: the text of those
+    // tokens, by stepping back over the others from the end of the text (not
+    // known when it does not end with them).
+    void cut_text(size_t n) {
+        if (n >= context_text_tokens) return;
+        size_t end = context_text.size();
+        bool known = n > 0;
+        for (size_t i = context_text_tokens; known && i-- > n;) known = step_back(context_text, end, i);
+        if (known) {
+            context_text.resize(end);
+            context_text_tokens = n;
+        } else {
+            context_text.clear();
+            context_text_tokens = 0;
+        }
+    }
+
+    // Tokens for `text`. When it continues a text the engine knows (this
+    // context's, or a context set aside in the prefix cache, which running
+    // the prompt then restores), that text's own tokens followed by the
+    // encoding of the rest: re-encoding an earlier reply need not give back
+    // the tokens that were generated, and on a hybrid model any difference
+    // would recompute from a state snapshot before it.
+    Result<std::vector<int32_t>> encode_continuation(std::string_view text, bool add_bos) const {
+        const bool bos = add_bos && tokenizer->add_bos_default();
+        const std::vector<int32_t>* known = nullptr;
+        size_t known_tokens = 0, known_bytes = 0;
+        auto consider = [&](const std::vector<int32_t>& tokens, const std::string& known_text, size_t n) {
+            if (n > 0 && known_text.size() >= known_bytes && text.size() > known_text.size() &&
+                text.starts_with(known_text) &&
+                (static_cast<unsigned char>(text[known_text.size()]) & 0xC0) != 0x80) {  // not mid-character
+                known = &tokens;
+                known_tokens = n;
+                known_bytes = known_text.size();
+            }
+        };
+        if (!draft) {
+            for (const PrefixEntry& e : prefix_cache) consider(e.tokens, e.text, e.text_tokens);
+            consider(context, context_text, context_text_tokens);  // preferred on a tie: nothing to restore
+            // A prompt that leaves this context's text partway (a draft edited,
+            // a message prepared ahead then typed over): the context's tokens
+            // up to the last one whose text the prompt still starts with,
+            // found by stepping back from the end of the text as cut_text()
+            // does. Re-encoding the whole prompt instead could diverge in an
+            // earlier reply and, on a hybrid model, go back past the draft's
+            // snapshots.
+            size_t same = 0;
+            const size_t most = std::min(text.size(), context_text.size());
+            while (same < most && text[same] == context_text[same]) ++same;
+            if (context_text_tokens > 0 && same < context_text.size() && same > known_bytes) {
+                size_t n = context_text_tokens, end = context_text.size();
+                while (n > 0 && end > same) {
+                    if (!step_back(context_text, end, n - 1)) {
+                        n = 0;  // the tokens do not spell the text: unknown
+                        break;
+                    }
+                    --n;
+                }
+                if (n > 0 && end > known_bytes && (static_cast<unsigned char>(text[end]) & 0xC0) != 0x80) {
+                    known = &context;
+                    known_tokens = n;
+                    known_bytes = end;
+                }
+            }
+        }
+        if (known != nullptr) {
+            auto rest = tokenizer->encode_continuation(text.substr(known_bytes), (*known)[known_tokens - 1]);
+            if (!rest) return rest.status();
+            std::vector<int32_t> tokens(known->begin(), known->begin() + static_cast<std::ptrdiff_t>(known_tokens));
+            tokens.insert(tokens.end(), rest->begin(), rest->end());
+            return tokens;
+        }
+        return tokenizer->encode(text, bos);
+    }
+
+    // After a run over `prompt` (the encoding of `text`): records the text the
+    // context now holds, if the context still starts with the whole prompt.
+    void remember_text(std::span<const int32_t> prompt, std::string_view text) {
+        if (context.size() < prompt.size() || !std::equal(prompt.begin(), prompt.end(), context.begin())) {
+            context_text.clear();
+            context_text_tokens = 0;
+            return;
+        }
+        context_text.assign(text);
+        for (size_t i = prompt.size(); i < context.size(); ++i) context_text += tokenizer->piece(context[i]);
+        context_text_tokens = context.size();
+    }
+
+    // Prefix cache (EngineConfig::prefix_cache_mb, prefix_cache_dir):
+    // contexts set aside when a prompt from another conversation replaced
+    // them (the chat, the assistant sheet, a background agent, other apps
+    // through an API), kept as serialized states (KV pages and recurrent
+    // states) with the text they encode, in an LRU of bounded size. A prompt
+    // that continues one of them restores it instead of processing it again.
+    // Only contexts the new prompt shares less than half of are set aside:
+    // edits within a conversation keep using the context's own snapshots.
+    // RAM holds what prefix_cache_mb allows; the rest, or everything when it
+    // is 0, goes to files in prefix_cache_dir: a phone's RAM is better spent
+    // on weights, and its storage writes and reads back a ~100 MB context in
+    // a fraction of a second, where processing it again takes minutes.
+    struct PrefixEntry {
+        std::vector<int32_t> tokens;
+        std::string state;  // Transformer::write_state, while in RAM
+        std::string file;   // where the state is, once on storage (`state` empty)
+        size_t bytes = 0;   // the state's size
+        std::string text;   // what its first text_tokens tokens encode (see context_text)
+        size_t text_tokens = 0;
+        uint64_t last_use = 0;
+    };
+    std::vector<PrefixEntry> prefix_cache;
+    size_t prefix_cache_budget = 0;       // RAM, bytes
+    size_t prefix_cache_disk_budget = 0;  // storage, bytes (0: no storage tier)
+    std::string prefix_cache_dir;
+    uint64_t prefix_clock = 0;
+    static constexpr size_t kMinPrefixEntry = 128;  // shorter contexts are cheaper to process again
+
+    [[nodiscard]] bool prefix_cache_on() const { return prefix_cache_budget > 0 || prefix_cache_disk_budget > 0; }
+
+    ~Impl() {
+        for (const PrefixEntry& e : prefix_cache) {
+            if (!e.file.empty()) std::remove(e.file.c_str());
+        }
+    }
+
+    size_t prefix_cache_bytes(bool on_storage) const {
+        size_t bytes = 0;
+        for (const PrefixEntry& e : prefix_cache) {
+            if (e.file.empty() != on_storage) bytes += e.bytes;
+        }
+        return bytes;
+    }
+
+    // The file of entry `id` (its last_use, unique in this engine): the
+    // process id keeps other processes (or an earlier one) from colliding,
+    // the engine's address the other engines of this one.
+    std::string prefix_file(uint64_t id) const {
+        return prefix_cache_dir + "/ctx-" + std::to_string(::getpid()) + "-" +
+               std::to_string(reinterpret_cast<uintptr_t>(this)) + "-" + std::to_string(id) + ".state";
+    }
+
+    // Writes entry `id`'s state to storage; the file, or empty when it could not be written.
+    std::string write_prefix_file(uint64_t id, const std::function<Status(std::ostream&)>& write) const {
+        const std::string path = prefix_file(id);
+        std::ofstream out(path, std::ios::binary | std::ios::trunc);
+        if (out && write(out).is_ok() && out.flush()) return path;
+        out.close();
+        std::remove(path.c_str());
+        LIYAB_LOG_WARN("prefix cache: cannot write %s", path.c_str());
+        return {};
+    }
+
+    void drop_prefix_entry(std::vector<PrefixEntry>::iterator it) {
+        if (!it->file.empty()) std::remove(it->file.c_str());
+        prefix_cache.erase(it);
+    }
+
+    // Least recently used entries over the RAM budget move to storage (or
+    // go, without it); over the storage budget, they go.
+    void trim_prefix_cache() {
+        auto oldest = [&](bool on_storage) {
+            auto best = prefix_cache.end();
+            for (auto it = prefix_cache.begin(); it != prefix_cache.end(); ++it) {
+                if (it->file.empty() != on_storage && (best == prefix_cache.end() || it->last_use < best->last_use)) {
+                    best = it;
+                }
+            }
+            return best;
+        };
+        while (prefix_cache_bytes(false) > prefix_cache_budget) {
+            const auto it = oldest(false);
+            if (prefix_cache_disk_budget >= it->bytes) {
+                it->file = write_prefix_file(it->last_use, [&](std::ostream& out) {
+                    out.write(it->state.data(), static_cast<std::streamsize>(it->state.size()));
+                    return out ? Status::ok() : Status(ErrorCode::IoError, "write failed");
+                });
+            }
+            if (it->file.empty()) {
+                prefix_cache.erase(it);
+            } else {
+                std::string().swap(it->state);
+            }
+        }
+        while (prefix_cache_bytes(true) > prefix_cache_disk_budget) drop_prefix_entry(oldest(true));
+    }
+
+    void stash_context() {
+        if (!prefix_cache_on() || context.size() < kMinPrefixEntry) return;
+        // The whole context, the last reply included: that conversation's next
+        // prompt re-sends it, and on a hybrid model a reply that encodes
+        // differently goes back to the pinned snapshot the state keeps (the
+        // last prompt's end). Setting it aside at that snapshot instead made
+        // every return process the last reply again (123 tokens, 8 s on a 35B).
+        for (auto it = prefix_cache.begin(); it != prefix_cache.end();) {  // an older copy of the same conversation
+            if (it->tokens.size() <= context.size() && std::equal(it->tokens.begin(), it->tokens.end(), context.begin())) {
+                if (!it->file.empty()) std::remove(it->file.c_str());
+                it = prefix_cache.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        PrefixEntry entry{context, {}, {}, 0, context_text, context_text_tokens, ++prefix_clock};
+        const auto watch = Clock::now();
+        if (prefix_cache_budget > 0) {
+            std::ostringstream out;
+            if (!target->write_state(out).is_ok()) return;
+            entry.state = std::move(out).str();
+            entry.bytes = entry.state.size();
+        } else {  // storage only: no copy in RAM on the way
+            size_t written = 0;
+            entry.file = write_prefix_file(entry.last_use, [&](std::ostream& out) {
+                LIYAB_RETURN_IF_ERROR(target->write_state(out));
+                written = static_cast<size_t>(out.tellp());
+                return Status::ok();
+            });
+            if (entry.file.empty()) return;
+            entry.bytes = written;
+        }
+        const uint64_t id = entry.last_use;
+        const double mib = static_cast<double>(entry.bytes) / (1024.0 * 1024.0);
+        prefix_cache.push_back(std::move(entry));
+        trim_prefix_cache();
+        if (std::any_of(prefix_cache.begin(), prefix_cache.end(), [&](const PrefixEntry& e) { return e.last_use == id; })) {
+            LIYAB_LOG_INFO("prefix cache: set aside %zu tokens (%.0f MiB) in %.0f ms", context.size(), mib, ms_since(watch));
+        } else {
+            LIYAB_LOG_INFO("prefix cache: a context of %zu tokens (%.0f MiB) is larger than the cache", context.size(), mib);
+        }
+    }
+
+    // Restores the cached context sharing the longest prefix with `tokens`
+    // (at most `limit` tokens of it) when that prefix is longer than `have`,
+    // cut back to where they diverge (a reply sent back as text may encode
+    // differently from the tokens generated); the tokens kept, or 0.
+    size_t restore_cached(std::span<const int32_t> tokens, size_t limit, size_t have) {
+        const PrefixEntry* best = nullptr;
+        size_t best_common = 0;
+        for (const PrefixEntry& e : prefix_cache) {
+            const size_t n = std::min({e.tokens.size(), tokens.size(), limit});
+            size_t common = 0;
+            while (common < n && e.tokens[common] == tokens[common]) ++common;
+            if (common > best_common) {
+                best = &e;
+                best_common = common;
+            }
+        }
+        if (best == nullptr || best_common <= have || best_common < kMinPrefixEntry) return 0;
+        const auto watch = Clock::now();
+        const auto it = prefix_cache.begin() + (best - prefix_cache.data());
+        Status read = Status::ok();
+        if (it->file.empty()) {
+            std::istringstream in(it->state);
+            read = target->read_state(in);
+        } else {
+            std::ifstream in(it->file, std::ios::binary);
+            read = in ? target->read_state(in) : Status(ErrorCode::IoError, "cannot read " + it->file);
+        }
+        if (!read.is_ok()) {
+            LIYAB_LOG_WARN("prefix cache: %s", read.to_string().c_str());
+            drop_prefix_entry(it);
+            clear_context();
+            return 0;
+        }
+        context = std::move(it->tokens);
+        context_text = std::move(it->text);
+        context_text_tokens = it->text_tokens;
+        const bool from_storage = !it->file.empty();
+        drop_prefix_entry(it);  // it is the live context now
+        size_t keep = context.size();
+        if (best_common < keep) {
+            keep = static_cast<size_t>(target->restorable_prefix(static_cast<int32_t>(best_common)));
+            if (keep == 0 || !target->truncate(static_cast<int32_t>(keep)).is_ok()) {
+                clear_context();
+                return 0;
+            }
+            cut_text(keep);
+            context.resize(keep);
+        }
+        LIYAB_LOG_INFO("prefix cache: restored %zu tokens from %s in %.0f ms", keep, from_storage ? "storage" : "RAM",
+                       ms_since(watch));
+        return keep;
+    }
+
+    size_t reuse_prefix(std::span<const int32_t> tokens, size_t limit) {
+        if (draft || context.size() != static_cast<size_t>(target->n_past())) {
+            clear_context();
+            return 0;
+        }
+        size_t common = 0;
+        const size_t n = std::min({context.size(), tokens.size(), limit});
+        while (common < n && context[common] == tokens[common]) ++common;
+        if (common == context.size()) return common;  // pure continuation: nothing to drop
+        if (prefix_cache_on() && common < context.size() / 2) {
+            stash_context();
+            if (const size_t restored = restore_cached(tokens, limit, common); restored > 0) return restored;
+            if (context.empty()) return 0;  // a cached context failed to restore
+        }
+        // Attention-only models rewind to any position; hybrid ones to the
+        // nearest recurrent-state checkpoint or snapshot below it.
+        const auto keep = static_cast<size_t>(target->restorable_prefix(static_cast<int32_t>(common)));
+        // Diverging from the context costs a recomputation from `keep`: say
+        // where, so a slow turn can be traced to its cause.
+        LIYAB_LOG_INFO("context: the prompt leaves the context at token %zu of %zu; %zu kept", common, context.size(),
+                       keep);
+        if (keep > 0 && target->truncate(static_cast<int32_t>(keep)).is_ok()) {
+            cut_text(keep);
+            context.resize(keep);
+            return keep;
+        }
+        clear_context();
+        return 0;
+    }
+    std::unique_ptr<TripleBufferLoader> weight_loader;
+    std::unique_ptr<SpeculativeDecoder> speculative;
+    std::optional<Tokenizer> tokenizer;
+    std::unique_ptr<PowerManager> power;
+    std::atomic<bool> cancel{false};
+    std::atomic<bool> cancel_prefill{false};  // Engine::cancel_prefill: prefill() only
+    std::mutex busy;
+#if defined(LIYAB_ENABLE_EXPERIMENTAL)
+    std::unique_ptr<experimental::EarlyExit> early_exit;
+    std::optional<experimental::HeadPruner> head_pruner;
+    std::unique_ptr<experimental::Egls> egls;
+    std::unique_ptr<experimental::Tdss> tdss;
+    std::unique_ptr<experimental::KvDedup> kv_dedup;
+#endif
+
+    // Experimental hooks for one forward pass given the current power policy.
+    ForwardHooks hooks(const PowerPolicy& policy, bool decoding) {
+        ForwardHooks h;
+#if defined(LIYAB_ENABLE_EXPERIMENTAL)
+        if (decoding && early_exit) h.early_exit = early_exit.get();
+        if (decoding && egls) h.ffn_skip = egls.get();
+        if (tdss && tdss->update(policy)) h.ffn_matmul = tdss.get();
+        if (head_pruner && head_pruner->update(policy, power->profile())) h.head_mask = &*head_pruner;
+#else
+        (void)policy;
+        (void)decoding;
+#endif
+        return h;
+    }
+
+    // Heterogeneous routing: attention projections on the GPU, FFN + output
+    // head on the NPU (highest TOPS/W for large integer matmuls), each
+    // falling back down the NPU → GPU → CPU chain.
+    [[nodiscard]] Route normal_route() const {
+        Backend* attention = gpu ? gpu.get() : cpu.get();
+        Backend* ffn = npu ? npu.get() : attention;
+        return {attention, ffn, cpu.get()};
+    }
+    // Thermal guard: take the GPU out of the loop (it is the hottest block on
+    // phone SoCs); heavy layers go to the NPU if present, else the CPU, which
+    // also runs with fewer cores under the power policy.
+    [[nodiscard]] Route throttled_route() const {
+        Backend* target_backend = npu ? npu.get() : cpu.get();
+        return {target_backend, target_backend, cpu.get()};
+    }
+    [[nodiscard]] Route draft_route() const { return {cpu.get(), cpu.get(), cpu.get()}; }
+
+    Status select_backends() {
+        std::vector<BackendKind> order = device.backend_order;
+        if (config.backend) order = {*config.backend, BackendKind::Cpu};
+        for (const BackendKind kind : order) {
+            switch (kind) {
+                case BackendKind::Cpu:
+                    break;
+                case BackendKind::Metal: {
+                    if (gpu) break;
+                    auto metal = make_metal_backend();
+                    if (metal) {
+                        gpu = std::move(metal).value();
+                    } else if (config.backend == BackendKind::Metal) {
+                        return metal.status();
+                    } else {
+                        LIYAB_LOG_WARN("metal unavailable: %s", metal.status().to_string().c_str());
+                    }
+                    break;
+                }
+                case BackendKind::Vulkan: {
+                    if (gpu) break;
+                    auto vulkan = make_vulkan_backend();
+                    if (vulkan) {
+                        gpu = std::move(vulkan).value();
+                    } else if (config.backend == BackendKind::Vulkan) {
+                        return vulkan.status();
+                    } else {
+                        LIYAB_LOG_WARN("vulkan unavailable: %s", vulkan.status().to_string().c_str());
+                    }
+                    break;
+                }
+                case BackendKind::Qnn:
+                case BackendKind::NeuroPilot:
+                    // Runtime present (probe succeeded) but Liyab has no compute
+                    // kernels for it yet: fall through to the next backend.
+                    if (config.backend == kind) {
+                        return Status(ErrorCode::Unsupported,
+                                      std::string(backend_kind_name(kind)) + " compute path is not implemented yet");
+                    }
+                    LIYAB_LOG_INFO("%s detected; compute path not implemented, using next backend",
+                                   backend_kind_name(kind));
+                    break;
+            }
+        }
+        return Status::ok();
+    }
+
+    // Streams dense blocks from storage through the 3-slot pipeline. `all`:
+    // every block (EngineConfig::triple_buffer_loading). Otherwise, for a
+    // dense model larger than RAM, as many blocks as fit stay resident (read
+    // in place from the mapping, which direct I/O never evicts) and the rest
+    // are streamed; the streamed blocks are spread evenly through the stack
+    // so storage keeps reading while resident blocks compute.
+    Status attach_layer_streaming(bool all) {
+        const MmapLoader& file = target->file();
+        const ModelConfig& c = target->config();
+        if (target->expert_store() != nullptr) {
+            if (all) {
+                return Status(ErrorCode::Unsupported, "triple-buffer loading and expert streaming are exclusive (MoE "
+                                                      "models stream their experts already)");
+            }
+            return Status::ok();
+        }
+        if (file.shard_count() > 1) {
+            if (all) return Status(ErrorCode::Unsupported, "block streaming needs a single-file model (this one is split)");
+            return Status::ok();  // split dense models keep the mmap streaming window
+        }
+        std::vector<size_t> bytes(static_cast<size_t>(c.n_layers));
+        size_t block_total = 0;
+        for (int32_t l = 0; l < c.n_layers; ++l) {
+            const auto [begin, end] = file.layer_range(l);
+            bytes[static_cast<size_t>(l)] = end - begin;
+            block_total += end - begin;
+        }
+        const size_t largest = *std::max_element(bytes.begin(), bytes.end());
+        int32_t streamed = c.n_layers;
+        if (!all) {
+            const uint64_t available = usable_memory_bytes(
+                config.memory_budget_mb > 0 ? static_cast<uint64_t>(config.memory_budget_mb) << 20 : 0);
+            if (available == 0 || static_cast<double>(file.file_size()) <= 0.8 * static_cast<double>(available)) {
+                return Status::ok();  // fits: in-place reads from the page cache
+            }
+            // Resident budget: free RAM minus the non-block weights, the 3
+            // pipeline slots and 1 GiB for KV cache, activations and the app.
+            const size_t fixed = file.file_size() - block_total + 3 * largest + (size_t{1} << 30);
+            const size_t budget = available > fixed ? static_cast<size_t>(available) - fixed : 0;
+            const size_t average = block_total / static_cast<size_t>(c.n_layers);
+            const auto resident = static_cast<int32_t>(std::min<size_t>(budget / average, static_cast<size_t>(c.n_layers)));
+            streamed = c.n_layers - resident;
+            if (streamed == 0) return Status::ok();
+        }
+        std::vector<int32_t> items(static_cast<size_t>(c.n_layers), -1);
+        std::vector<TripleBufferLoader::Item> ranges;
+        for (int32_t l = 0; l < c.n_layers; ++l) {
+            // Evenly spaced: block l streams when floor((l+1)s/n) > floor(ls/n).
+            if ((int64_t{l} + 1) * streamed / c.n_layers > int64_t{l} * streamed / c.n_layers) {
+                items[static_cast<size_t>(l)] = static_cast<int32_t>(ranges.size());
+                const auto [begin, end] = file.layer_range(l);
+                ranges.push_back({begin, end - begin});
+            }
+        }
+        auto reader = DirectFile::open(file.file().path());
+        if (!reader) return reader.status();
+        direct_file = std::move(reader).value();
+        // Stage 1: a few concurrent large direct reads saturate UFS (see direct_io.h).
+        TripleBufferLoader::FetchFn fetch = [f = direct_file.get()](uint64_t offset, size_t length, uint8_t* dst) {
+            return f->read_parallel(offset, length, dst, 4);
+        };
+        // With a GPU that can share memory, the slots and every resident
+        // block live in that memory: direct reads land where the GPU reads,
+        // nothing is copied or cached per tensor, and streamed blocks run on
+        // the GPU like resident ones.
+        Backend* shared = nullptr;
+        if (gpu) {
+            if (uint8_t* probe = gpu->allocate_shared(DirectFile::kAlign)) {
+                gpu->free_shared(probe);
+                shared = gpu.get();
+            }
+        }
+        TripleBufferLoader::SlotMemory slot_memory;
+        if (shared != nullptr) {
+            slot_memory.allocate = [shared](size_t bytes) { return shared->allocate_shared(bytes); };
+            slot_memory.release = [shared](uint8_t* p) { shared->free_shared(p); };
+        }
+        // Stage 2 is a pass-through: the kernels consume packed blocks directly.
+        auto loader = TripleBufferLoader::create(ranges, fetch, {}, 0, slot_memory);  // copies: retried below
+        if (!loader && shared != nullptr) {
+            LIYAB_LOG_WARN("streaming slots in GPU-shared memory failed (%s); using host memory",
+                           loader.status().to_string().c_str());
+            shared = nullptr;
+            loader = TripleBufferLoader::create(std::move(ranges), std::move(fetch));
+        }
+        if (!loader) return loader.status();
+        weight_loader = std::move(loader).value();
+        std::vector<std::pair<size_t, size_t>> relocated;
+        if (shared != nullptr) {
+            for (int32_t l = 0; l <= c.n_layers; ++l) {  // resident blocks + the output head slot
+                if (l < c.n_layers && items[static_cast<size_t>(l)] >= 0) continue;
+                relocated.push_back(file.layer_range(l));
+            }
+            auto moved = target->mutable_file().relocate(
+                relocated, [shared](size_t bytes) { return shared->allocate_shared(bytes); });
+            if (!moved) return moved.status();
+            LIYAB_LOG_INFO("block streaming: %.2f GiB of resident weights placed in GPU-shared memory",
+                           static_cast<double>(moved.value()) / (1024.0 * 1024.0 * 1024.0));
+        }
+        auto in_ranges = [&](const TensorView& t, bool streamed_ranges) {
+            if (streamed_ranges) {
+                for (int32_t l = 0; l < c.n_layers; ++l) {
+                    if (items[static_cast<size_t>(l)] < 0) continue;
+                    const auto [begin, end] = file.layer_range(l);
+                    if (t.file_offset >= begin && t.file_offset < end) return true;
+                }
+                return false;
+            }
+            for (const auto& [begin, end] : relocated) {
+                if (t.file_offset >= begin && t.file_offset < end) return true;
+            }
+            return false;
+        };
+        // What still lives in the mapping (e.g. the embedding table, read a row
+        // at a time) stays paged in; streamed and relocated bytes are dropped
+        // from the page cache and never read through the mapping.
+        const size_t resident_bytes = target->mutable_file().keep_resident(
+            [&](const TensorView& t) { return !in_ranges(t, true) && !in_ranges(t, false); });
+        target->set_layer_source(weight_loader.get(), std::move(items), shared != nullptr);
+        LIYAB_LOG_INFO("block streaming: %d of %d blocks streamed (%s direct reads, 3 x %.0f MiB slots%s), %.2f GiB "
+                       "left in the mapping",
+                       streamed, c.n_layers, direct_file->direct() ? "O_DIRECT" : "buffered",
+                       static_cast<double>(weight_loader->slot_bytes()) / (1024.0 * 1024.0),
+                       shared != nullptr ? " in GPU-shared memory" : "",
+                       static_cast<double>(resident_bytes) / (1024.0 * 1024.0 * 1024.0));
+        return Status::ok();
+    }
+
+    // MoE expert streaming with a GPU: the resident (non-expert) weights move
+    // into GPU-shared memory, read once with direct I/O. The GPU then reads
+    // them in place with its native kernels instead of keeping a second,
+    // repacked copy next to the mapping (which the expert cache budget, sized
+    // at load, does not account for).
+    Status share_resident_weights() {
+        if (!gpu || target->expert_store() == nullptr) return Status::ok();
+        uint8_t* probe = gpu->allocate_shared(DirectFile::kAlign);
+        if (probe == nullptr) return Status::ok();
+        gpu->free_shared(probe);
+        auto is_expert = [](const TensorView& t) {
+            const std::string_view n = t.name;
+            return n.size() > 13 && n.substr(n.size() - 12) == "_exps.weight";
+        };
+        // Runs of consecutive non-expert tensors of the first file become one
+        // range each (gaps under 1 MiB are read along).
+        std::vector<const TensorView*> resident;
+        for (const TensorView& t : target->file().tensors()) {
+            // requantize()d tensors already live in memory of their own.
+            if (t.shard == 0 && !is_expert(t) && !target->file().converted(t)) resident.push_back(&t);
+        }
+        std::sort(resident.begin(), resident.end(),
+                  [](const TensorView* a, const TensorView* b) { return a->file_offset < b->file_offset; });
+        std::vector<std::pair<size_t, size_t>> ranges;
+        for (const TensorView* t : resident) {
+            const auto begin = static_cast<size_t>(t->file_offset);
+            const size_t end = begin + t->nbytes;
+            if (!ranges.empty() && begin <= ranges.back().second + (size_t{1} << 20)) {
+                ranges.back().second = std::max(ranges.back().second, end);
+            } else {
+                ranges.emplace_back(begin, end);
+            }
+        }
+        Backend* shared = gpu.get();
+        auto moved = target->mutable_file().relocate(ranges, [shared](size_t bytes) { return shared->allocate_shared(bytes); });
+        if (!moved) return moved.status();
+        LIYAB_LOG_INFO("expert streaming: %.2f GiB of resident weights placed in GPU-shared memory (%zu ranges)",
+                       static_cast<double>(moved.value()) / (1024.0 * 1024.0 * 1024.0), ranges.size());
+        return Status::ok();
+    }
+
+    // Tokens per prefill pass. With streamed MoE experts a pass reads the
+    // union of the experts its tokens choose, and 64 tokens already choose
+    // most of them: Qwen3.6-35B-A3B prefilled 1700 tokens in 180 s in passes
+    // of 64, rereading nearly every expert from storage 27 times. Passes of
+    // kStreamedPrefillChunk read each expert once per 1024 tokens: a 706-token
+    // prompt read 26 MiB per token instead of 36 with passes of 512 and 70
+    // with 64, for 81 MiB more peak memory than 512. Other models keep
+    // max_batch passes.
+    static constexpr int32_t kStreamedPrefillChunk = 1024;
+    [[nodiscard]] int32_t prefill_chunk() const {
+        return target->expert_store() != nullptr ? std::max(target->max_batch(), kStreamedPrefillChunk)
+                                                 : target->max_batch();
+    }
+
+    void apply_policy(const PowerPolicy& policy) {
+        const auto threads = static_cast<int32_t>(std::lround(pool->max_threads() * policy.thread_fraction));
+        pool->set_active_threads(std::max(1, threads));
+    }
+};
+
+Engine::Engine(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
+Engine::~Engine() = default;
+
+Result<std::unique_ptr<Engine>> Engine::create(const EngineConfig& config) {
+    if (config.model_path.empty()) return Status(ErrorCode::InvalidArgument, "model_path is required");
+    if (config.sliding_window < 0 || config.context_length < 0 || config.draft_tokens < 0) {
+        return Status(ErrorCode::InvalidArgument, "negative size in EngineConfig");
+    }
+#if !defined(LIYAB_ENABLE_EXPERIMENTAL)
+    if (config.experimental.early_exit || config.experimental.head_pruning || config.experimental.egls ||
+        config.experimental.tdss || !config.experimental.kv_dedup_dir.empty()) {
+        return Status(ErrorCode::Unsupported, "experimental features need a build with LIYAB_ENABLE_EXPERIMENTAL=ON");
+    }
+#endif
+
+    auto impl = std::make_unique<Impl>();
+    impl->config = config;
+    const auto t_create = Clock::now();
+    impl->device = detect_device();
+    LIYAB_LOG_INFO("device: %s (%s), %d cores, %.1f GiB available", impl->device.soc.name.c_str(),
+                   soc_vendor_name(impl->device.soc.vendor), impl->device.cpu.cores,
+                   static_cast<double>(impl->device.available_memory) / (1024.0 * 1024.0 * 1024.0));
+    impl->pool = std::make_unique<ThreadPool>(config.n_threads);
+    impl->cpu = make_cpu_backend(*impl->pool);
+    LIYAB_RETURN_IF_ERROR(impl->select_backends());
+
+    // Prefill chunks and speculative verification batches share max_batch.
+    const int32_t max_batch = std::max(64, config.draft_tokens + 1);
+    // Repacked weights are for the CPU's i8mm kernels only: no GPU / NPU route.
+    const bool repack_cpu = !impl->gpu && !impl->npu && impl->device.cpu.i8mm && quant::repack_kernels_available();
+    auto target = load_model(config.model_path, config, max_batch, repack_cpu);
+    if (!target) return target.status();
+    impl->target = std::move(target).value();
+
+    LIYAB_RETURN_IF_ERROR(impl->attach_layer_streaming(config.triple_buffer_loading));
+    LIYAB_RETURN_IF_ERROR(impl->share_resident_weights());
+
+    auto tokenizer = Tokenizer::load(impl->target->file());
+    if (!tokenizer) return tokenizer.status();
+    impl->tokenizer.emplace(std::move(tokenizer).value());
+
+    if (!config.draft_model_path.empty() && config.draft_tokens > 0) {
+        auto draft = load_model(config.draft_model_path, config, max_batch, repack_cpu);
+        if (!draft) return draft.status();
+        if (draft.value()->config().n_vocab != impl->target->config().n_vocab) {
+            return Status(ErrorCode::InvalidArgument, "draft and target models must share a vocabulary");
+        }
+        // Rejected drafts are rolled back; recurrent (DeltaNet) states need a
+        // checkpoint per position of a verification batch (k + 1).
+        impl->target->set_rollback_window(config.draft_tokens + 1);
+        draft.value()->set_rollback_window(config.draft_tokens + 1);
+        impl->draft = std::move(draft).value();
+        impl->speculative = std::make_unique<SpeculativeDecoder>(*impl->target, *impl->draft, config.draft_tokens);
+    } else if (config.lookup_drafts && config.draft_tokens > 0) {
+        impl->target->set_rollback_window(config.draft_tokens + 1);
+        impl->speculative = std::make_unique<SpeculativeDecoder>(*impl->target, config.draft_tokens);
+    }
+    if (impl->speculative) impl->speculative->set_adaptive(config.adaptive_drafts);
+
+#if defined(LIYAB_ENABLE_EXPERIMENTAL)
+    const ExperimentalConfig& x = config.experimental;
+    if (x.early_exit) {
+        impl->early_exit = std::make_unique<experimental::EarlyExit>(
+            experimental::EarlyExitConfig{x.early_exit_threshold, x.early_exit_min_layer, x.early_exit_interval});
+    }
+    if (x.tdss) {
+        if (impl->target->config().n_expert > 0) {
+            return Status(ErrorCode::Unsupported, "TDSS sparsifies dense FFNs; this model uses mixture-of-experts FFNs");
+        }
+        std::vector<std::array<const TensorView*, 3>> ffn;
+        for (int32_t l = 0; l < impl->target->config().n_layers; ++l) ffn.push_back(impl->target->ffn_weights(l));
+        auto tdss = experimental::Tdss::create(ffn, *impl->pool, {x.tdss_force});
+        if (!tdss) return tdss.status();
+        impl->tdss = std::move(tdss).value();
+        LIYAB_LOG_INFO("TDSS: 2:4 sparse FFN copy %.1f MiB (dense %.1f MiB)",
+                       static_cast<double>(impl->tdss->sparse_bytes()) / (1024.0 * 1024.0),
+                       static_cast<double>(impl->tdss->dense_bytes()) / (1024.0 * 1024.0));
+    }
+    if (!x.kv_dedup_dir.empty()) {
+        auto dedup = experimental::KvDedup::create(
+            x.kv_dedup_dir, experimental::model_fingerprint(impl->target->file().file()));
+        if (!dedup) return dedup.status();
+        impl->kv_dedup = std::move(dedup).value();
+    }
+    if (x.egls) impl->egls = std::make_unique<experimental::Egls>(experimental::EglsConfig{x.egls_threshold});
+    if (x.head_pruning) {
+        if (impl->target->config().hybrid()) {
+            return Status(ErrorCode::Unsupported, "head pruning needs attention in every block (not a hybrid model)");
+        }
+        std::vector<const TensorView*> wo;
+        for (int32_t l = 0; l < impl->target->config().n_layers; ++l) wo.push_back(impl->target->attn_output(l));
+        auto pruner = experimental::HeadPruner::create(wo, impl->target->config().n_head,
+                                                        impl->target->config().head_dim, {x.head_keep_ratio});
+        if (!pruner) return pruner.status();
+        impl->head_pruner.emplace(std::move(pruner).value());
+    }
+#endif
+
+    impl->power = std::make_unique<PowerManager>(config.power);
+    // With a budget, a MoE whose experts stream gives the prefix cache only
+    // what its expert cache can spare (see load_model).
+    impl->prefix_cache_budget = config.prefix_cache_mb > 0 ? static_cast<size_t>(config.prefix_cache_mb) << 20 : 0;
+    if (impl->prefix_cache_budget > 0 && config.memory_budget_mb > 0 && impl->target->expert_store() != nullptr) {
+        const size_t granted = impl->target->memory_plan().reserved_bytes;
+        if (granted < impl->prefix_cache_budget) {
+            LIYAB_LOG_INFO("prefix cache: %zu of %lld MiB (more would leave the expert cache under %.0f%% of the experts)",
+                           granted >> 20, static_cast<long long>(config.prefix_cache_mb),
+                           100.0 * Transformer::kTightCache);
+        }
+        impl->prefix_cache_budget = granted;
+    }
+    // Storage tier: the engine removes its files when destroyed, and when it
+    // starts, files left by processes that ended (other process ids).
+    if (config.prefix_cache_disk_mb > 0 && !config.prefix_cache_dir.empty()) {
+        std::error_code ec;
+        std::filesystem::create_directories(config.prefix_cache_dir, ec);
+        if (ec) {
+            LIYAB_LOG_WARN("prefix cache: cannot use %s: %s", config.prefix_cache_dir.c_str(), ec.message().c_str());
+        } else {
+            const std::string own = "ctx-" + std::to_string(::getpid()) + "-";
+            std::filesystem::directory_iterator it(config.prefix_cache_dir, ec), end;
+            for (; !ec && it != end; it.increment(ec)) {
+                const std::string name = it->path().filename().string();
+                std::error_code ignored;
+                if (name.starts_with("ctx-") && name.ends_with(".state") && !name.starts_with(own)) {
+                    std::filesystem::remove(it->path(), ignored);
+                }
+            }
+            impl->prefix_cache_dir = config.prefix_cache_dir;
+            impl->prefix_cache_disk_budget = static_cast<size_t>(config.prefix_cache_disk_mb) << 20;
+        }
+    }
+    impl->power->poll_once();
+    if (config.thermal_polling) impl->power->start();
+    const Route route = impl->normal_route();
+    LIYAB_LOG_INFO("engine ready in %.0f ms: attention on %s, FFN on %s, %d threads%s", ms_since(t_create),
+                   route.attention->description().c_str(), route.ffn->description().c_str(),
+                   impl->pool->max_threads(), impl->speculative ? ", speculative decoding" : "");
+
+    return std::unique_ptr<Engine>(new Engine(std::move(impl)));
+}
+
+void Engine::cancel() noexcept { impl_->cancel.store(true, std::memory_order_relaxed); }
+
+void Engine::cancel_prefill() noexcept { impl_->cancel_prefill.store(true, std::memory_order_relaxed); }
+
+const DeviceInfo& Engine::device() const noexcept { return impl_->device; }
+
+PowerManager& Engine::power() noexcept { return *impl_->power; }
+
+Result<std::vector<int32_t>> Engine::tokenize(std::string_view text, bool add_bos) const {
+    // BOS only when requested *and* the model uses one (Qwen does not).
+    return impl_->tokenizer->encode(text, add_bos && impl_->tokenizer->add_bos_default());
+}
+
+std::string Engine::token_to_piece(int32_t token) const { return impl_->tokenizer->piece(token); }
+
+namespace {
+constexpr char kExpertProfileMagic[4] = {'L', 'X', 'H', 'L'};
+}  // namespace
+
+size_t Engine::warm_memory() {
+    ExpertStore* store = impl_->target->expert_store();
+    const size_t queued = store != nullptr ? store->warm() : 0;
+    if (queued > 0) LIYAB_LOG_INFO("warming the expert cache: %zu experts queued", queued);
+    return queued;
+}
+
+Status Engine::save_expert_profile(const std::string& path) const {
+    const ExpertStore* store = impl_->target->expert_store();
+    if (store == nullptr) return Status::ok();
+    const std::vector<int32_t> keys = store->hot_keys();
+    const ModelConfig& c = impl_->target->config();
+    // Header: magic, model file size, blocks, experts per block, count.
+    const int64_t header[] = {static_cast<int64_t>(impl_->target->file().file_size()), c.n_layers, c.n_expert,
+                              static_cast<int64_t>(keys.size())};
+    const std::string tmp = path + ".tmp";
+    {
+        std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
+        out.write(kExpertProfileMagic, sizeof kExpertProfileMagic);
+        out.write(reinterpret_cast<const char*>(header), sizeof header);
+        out.write(reinterpret_cast<const char*>(keys.data()), static_cast<std::streamsize>(keys.size() * sizeof(int32_t)));
+        if (!out) return Status(ErrorCode::IoError, "cannot write " + tmp);
+    }
+    if (std::rename(tmp.c_str(), path.c_str()) != 0) return Status(ErrorCode::IoError, "cannot rename " + tmp);
+    return Status::ok();
+}
+
+Status Engine::load_expert_profile(const std::string& path) {
+    ExpertStore* store = impl_->target->expert_store();
+    if (store == nullptr) return Status::ok();
+    std::ifstream in(path, std::ios::binary);
+    char magic[4] = {};
+    int64_t header[4] = {};
+    in.read(magic, sizeof magic);
+    in.read(reinterpret_cast<char*>(header), sizeof header);
+    const ModelConfig& c = impl_->target->config();
+    if (!in || std::memcmp(magic, kExpertProfileMagic, sizeof magic) != 0) {
+        return Status(ErrorCode::IoError, "not an expert profile: " + path);
+    }
+    if (header[0] != static_cast<int64_t>(impl_->target->file().file_size()) || header[1] != c.n_layers ||
+        header[2] != c.n_expert || header[3] < 0 || header[3] > static_cast<int64_t>(c.n_layers) * c.n_expert) {
+        return Status(ErrorCode::InvalidArgument, "expert profile of another model: " + path);
+    }
+    std::vector<int32_t> keys(static_cast<size_t>(header[3]));
+    in.read(reinterpret_cast<char*>(keys.data()), static_cast<std::streamsize>(keys.size() * sizeof(int32_t)));
+    if (!in) return Status(ErrorCode::IoError, "truncated expert profile: " + path);
+    store->set_hot(std::move(keys));
+    return Status::ok();
+}
+
+int32_t Engine::context_length() const noexcept { return impl_->target->context_length(); }
+
+Engine::MemoryPlan Engine::memory_plan() const {
+    const Transformer::MemoryPlan& p = impl_->target->memory_plan();
+    return {p.resident_bytes, p.expert_bytes, p.expert_cache_bytes, p.recommended_bytes, p.requant_bits};
+}
+
+size_t Engine::trim_memory() {
+    size_t released = 0;
+    if (ExpertStore* store = impl_->target->expert_store()) released += store->trim();
+    if (impl_->draft) {
+        if (ExpertStore* store = impl_->draft->expert_store()) released += store->trim();
+    }
+    if (released > 0) LIYAB_LOG_INFO("trimmed %.2f GiB of cached experts", released / (1024.0 * 1024.0 * 1024.0));
+    return released;
+}
+
+Engine::Counters Engine::counters() const {
+    Counters c;
+    if (impl_->gpu) c.accelerator_busy_ms = impl_->gpu->busy_ms();
+    if (const ExpertStore* store = impl_->target->expert_store()) c.storage_bytes_read += store->stats().bytes_read;
+    if (impl_->weight_loader) c.storage_bytes_read += impl_->weight_loader->stats().bytes_fetched;
+    c.tokens_generated = impl_->tokens_generated.load(std::memory_order_relaxed);
+    return c;
+}
+
+std::optional<std::string> Engine::model_metadata(std::string_view key) const {
+    const GgufValue* v = impl_->target->file().metadata(key);
+    if (v == nullptr) return std::nullopt;
+    if (const auto s = v->as_string()) return std::string(*s);
+    if (const auto b = v->as_bool()) return std::string(*b ? "true" : "false");
+    if (const auto i = v->as_int()) return std::to_string(*i);
+    if (const auto d = v->as_float()) {
+        char buf[32];
+        std::snprintf(buf, sizeof buf, "%.9g", *d);
+        return std::string(buf);
+    }
+    return std::nullopt;
+}
+
+std::string Engine::describe() const {
+    const ModelConfig& c = impl_->target->config();
+    const KvCache& kv = impl_->target->kv_cache();
+    char buf[768];
+    std::string window = kv.window() > 0 ? " (window " + std::to_string(kv.window()) + " + " +
+                                               std::to_string(kv.sink_tokens()) + " sink tokens)"
+                                         : "";
+    std::snprintf(buf, sizeof buf,
+                  "Model:      %s, %d layers, d=%d, vocab=%d, %.2f GiB (%s)\n"
+                  "Context:    %d tokens%s\n"
+                  "KV cache:   %s, paged (%d tokens/page, %.1f KiB/token)\n"
+                  "Weights:    %s\n",
+                  c.arch.c_str(), c.n_layers, c.n_embd, c.n_vocab,
+                  static_cast<double>(impl_->target->file().file_size()) / (1024.0 * 1024.0 * 1024.0),
+                  impl_->target->file().streaming() ? "streaming" : "resident", impl_->target->context_length(),
+                  window.c_str(), std::string(dtype_traits(kv.dtype()).name).c_str(), kv.config().page_tokens,
+                  static_cast<double>(KvCache::bytes_per_token(kv.config().n_layers, c.n_head_kv, c.head_dim, kv.config().type)) /
+                      1024.0,
+                  impl_->weight_loader
+                      ? ("triple-buffered blocks, 3 x " +
+                         std::to_string(impl_->weight_loader->slot_bytes() / (1024 * 1024)) + " MiB slots")
+                            .c_str()
+                      : "mmap, read in place (zero-copy)");
+    const Route route = impl_->normal_route();
+    std::string out = describe_device(impl_->device) + buf;
+    out += "Attention:  " + route.attention->description() + "\n";
+    out += "FFN:        " + route.ffn->description() + "\n";
+    if (c.hybrid()) {
+        char mix[160];
+        std::snprintf(mix, sizeof mix, "Mixers:     %d attention + %d DeltaNet blocks, recurrent state %.1f MiB\n",
+                      c.n_attn_layers, c.n_layers - c.n_attn_layers,
+                      static_cast<double>(impl_->target->recurrent_state_bytes()) / (1024.0 * 1024.0));
+        out += mix;
+    }
+    if (impl_->draft) {
+        out += "Draft:      " + impl_->draft->config().arch + ", " + std::to_string(impl_->draft->config().n_layers) +
+               " layers, k=" + std::to_string(impl_->config.draft_tokens) + " (cpu)\n";
+    }
+    return out;
+}
+
+Status Engine::prefill(std::string_view text, bool add_bos) {
+    std::unique_lock<std::mutex> lock(impl_->busy, std::try_to_lock);
+    if (!lock.owns_lock()) return Status(ErrorCode::Busy, "a generation is already running on this engine");
+    Impl& s = *impl_;
+    if (s.draft) return Status(ErrorCode::Unsupported, "prefill() is not available with a draft model");
+    auto tokens = s.encode_continuation(text, add_bos);
+    if (!tokens) return tokens.status();
+    s.cancel_prefill.store(false, std::memory_order_relaxed);
+    const PowerManager::Work thermal(*s.power);  // thermal sampling while this runs
+    const std::vector<int32_t>& t = tokens.value();
+    const size_t reused = s.reuse_prefix(t, t.size());
+    const PowerPolicy policy = s.power->policy();
+    s.apply_policy(policy);
+    const Route route = policy.throttled ? s.throttled_route() : s.normal_route();
+    ForwardHooks hooks = s.hooks(policy, false);
+    // Interruptible within a pass (cancel_prefill() is checked between
+    // blocks): a pass of 1024 tokens of a streamed MoE runs for tens of
+    // seconds. The work done so far stays: a hybrid model's state is
+    // snapshotted before each pass, and an abandoned pass returns to it, so
+    // the next prompt continuing this text resumes there.
+    hooks.cancel = &s.cancel_prefill;
+    const auto chunk = static_cast<size_t>(s.prefill_chunk());
+    for (size_t i = reused; i < t.size(); i += chunk) {
+        if (s.target->config().hybrid()) s.target->snapshot_state();
+        const std::span<const int32_t> part(t.data() + i, std::min(chunk, t.size() - i));
+        if (auto r = s.target->forward(part, Transformer::Logits::None, route, *s.pool, &hooks); !r) {
+            if (r.status().code() == ErrorCode::Cancelled && s.target->abandon_pass().is_ok()) {
+                return Status(ErrorCode::Cancelled, "prefill cancelled");
+            }
+            s.clear_context();
+            return r.status();
+        }
+        s.context.insert(s.context.end(), part.begin(), part.end());
+    }
+    s.target->snapshot_state();  // the next prompt starts with this text
+    s.remember_text(t, text);
+    return Status::ok();
+}
+
+namespace {
+constexpr uint32_t kContextMagic = 0x5458434C;  // "LCXT": the engine's part after the model's state
+}
+
+namespace {
+
+// After the model's state: magic, token count, tokens, then the text they
+// encode (its length, UINT64_MAX when not known) and how many of the tokens it
+// covers. Files written before that count was saved end after the text, which
+// then covers every token.
+void write_context_tail(std::ostream& out, const std::vector<int32_t>& tokens, const std::string& text,
+                        size_t text_tokens) {
+    const auto n = static_cast<uint64_t>(tokens.size());
+    const bool known = text_tokens > 0;
+    const uint64_t length = known ? text.size() : UINT64_MAX;
+    const auto covered = static_cast<uint64_t>(text_tokens);
+    out.write(reinterpret_cast<const char*>(&kContextMagic), sizeof kContextMagic);
+    out.write(reinterpret_cast<const char*>(&n), sizeof n);
+    out.write(reinterpret_cast<const char*>(tokens.data()), static_cast<std::streamsize>(n * sizeof(int32_t)));
+    out.write(reinterpret_cast<const char*>(&length), sizeof length);
+    if (known) {
+        out.write(text.data(), static_cast<std::streamsize>(text.size()));
+        out.write(reinterpret_cast<const char*>(&covered), sizeof covered);
+    }
+}
+
+// Writes `write`'s output to `path` through a temporary file, so `path` is
+// either the old file or the new one.
+Status write_replacing(const std::string& path, const std::function<Status(std::ostream&)>& write) {
+    const std::string tmp = path + ".tmp";
+    {
+        std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
+        if (!out) return Status(ErrorCode::IoError, "cannot write " + tmp);
+        if (Status s = write(out); !s.is_ok()) {
+            out.close();
+            std::remove(tmp.c_str());
+            return s;
+        }
+        if (!out.flush()) return Status(ErrorCode::IoError, "cannot write " + tmp);
+    }
+    if (std::rename(tmp.c_str(), path.c_str()) != 0) {
+        std::remove(tmp.c_str());
+        return Status(ErrorCode::IoError, "cannot replace " + path);
+    }
+    return Status::ok();
+}
+
+}  // namespace
+
+Status Engine::save_state(const std::string& path) {
+    std::unique_lock<std::mutex> lock(impl_->busy, std::try_to_lock);
+    if (!lock.owns_lock()) return Status(ErrorCode::Busy, "a generation is already running on this engine");
+    Impl& s = *impl_;
+    if (s.draft) return Status(ErrorCode::Unsupported, "save_state() is not available with a draft model");
+    return write_replacing(path, [&s](std::ostream& out) {
+        LIYAB_RETURN_IF_ERROR(s.target->write_state(out));
+        write_context_tail(out, s.context, s.context_text, s.context_text_tokens);
+        return Status::ok();
+    });
+}
+
+Status Engine::save_state(const std::string& path, std::string_view text) {
+    {
+        std::unique_lock<std::mutex> lock(impl_->busy, std::try_to_lock);
+        if (!lock.owns_lock()) return Status(ErrorCode::Busy, "a generation is already running on this engine");
+        Impl& s = *impl_;
+        if (s.draft) return Status(ErrorCode::Unsupported, "save_state() is not available with a draft model");
+        const bool live = s.context_text_tokens > 0 && text.starts_with(s.context_text);
+        if (!live) {
+            // The longest context set aside for this text, written as it is
+            // kept: nothing is restored or processed.
+            const Impl::PrefixEntry* best = nullptr;
+            for (const Impl::PrefixEntry& e : s.prefix_cache) {
+                if (e.text_tokens > 0 && text.starts_with(e.text) && (best == nullptr || e.text_tokens > best->text_tokens)) {
+                    best = &e;
+                }
+            }
+            if (best == nullptr) return Status(ErrorCode::InvalidArgument, "no context continues this text");
+            return write_replacing(path, [best](std::ostream& out) {
+                if (best->file.empty()) {
+                    out.write(best->state.data(), static_cast<std::streamsize>(best->state.size()));
+                } else {
+                    std::ifstream in(best->file, std::ios::binary);
+                    if (!in) return Status(ErrorCode::IoError, "cannot read " + best->file);
+                    out << in.rdbuf();
+                }
+                write_context_tail(out, best->tokens, best->text, best->text_tokens);
+                return out ? Status::ok() : Status(ErrorCode::IoError, "cannot write the context state");
+            });
+        }
+    }
+    return save_state(path);
+}
+
+Result<int32_t> Engine::load_state(const std::string& path) {
+    std::unique_lock<std::mutex> lock(impl_->busy, std::try_to_lock);
+    if (!lock.owns_lock()) return Status(ErrorCode::Busy, "a generation is already running on this engine");
+    Impl& s = *impl_;
+    if (s.draft) return Status(ErrorCode::Unsupported, "load_state() is not available with a draft model");
+    s.clear_context();
+    std::ifstream in(path, std::ios::binary);
+    if (!in) return Status(ErrorCode::IoError, "cannot read " + path);
+    LIYAB_RETURN_IF_ERROR(s.target->read_state(in));
+    uint32_t magic = 0;
+    uint64_t n = 0, text = 0;
+    const auto damaged = [&s] {
+        s.clear_context();
+        return Status(ErrorCode::IoError, "the saved context is damaged");
+    };
+    if (!in.read(reinterpret_cast<char*>(&magic), sizeof magic) || magic != kContextMagic ||
+        !in.read(reinterpret_cast<char*>(&n), sizeof n) || n != static_cast<uint64_t>(s.target->n_past())) {
+        return damaged();
+    }
+    s.context.resize(n);
+    if (!in.read(reinterpret_cast<char*>(s.context.data()), static_cast<std::streamsize>(n * sizeof(int32_t))) ||
+        !in.read(reinterpret_cast<char*>(&text), sizeof text)) {
+        return damaged();
+    }
+    if (text != UINT64_MAX) {
+        if (text > (uint64_t{1} << 30)) return damaged();
+        s.context_text.resize(text);
+        if (!in.read(s.context_text.data(), static_cast<std::streamsize>(text))) return damaged();
+        uint64_t covered = 0;
+        if (!in.read(reinterpret_cast<char*>(&covered), sizeof covered)) {
+            covered = n;  // written before the count was saved: the text covers every token
+        } else if (covered == 0 || covered > n) {
+            return damaged();
+        }
+        s.context_text_tokens = static_cast<size_t>(covered);
+    }
+    return static_cast<int32_t>(n);
+}
+
+void Engine::reset_context() {
+    std::lock_guard<std::mutex> lock(impl_->busy);
+    impl_->clear_context();
+}
+
+Result<GenerationStats> Engine::generate(std::string_view prompt, const SamplingParams& params,
+                                         const TokenCallback& on_token) {
+    std::unique_lock<std::mutex> lock(impl_->busy, std::try_to_lock);
+    if (!lock.owns_lock()) return Status(ErrorCode::Busy, "a generation is already running on this engine");
+    auto tokens = impl_->encode_continuation(prompt, params.add_bos);
+    if (!tokens) return tokens.status();
+    return generate_locked(*tokens, params, on_token, &prompt);
+}
+
+Result<GenerationStats> Engine::generate(std::string_view prompt, const SamplingParams& params,
+                                         const TokenCallback& on_token, const ForceCallback& force) {
+    std::unique_lock<std::mutex> lock(impl_->busy, std::try_to_lock);
+    if (!lock.owns_lock()) return Status(ErrorCode::Busy, "a generation is already running on this engine");
+    auto tokens = impl_->encode_continuation(prompt, params.add_bos);
+    if (!tokens) return tokens.status();
+    return generate_locked(*tokens, params, on_token, &prompt, force ? &force : nullptr);
+}
+
+Result<GenerationStats> Engine::generate_tokens(std::span<const int32_t> prompt, const SamplingParams& params,
+                                                const TokenCallback& on_token) {
+    std::unique_lock<std::mutex> lock(impl_->busy, std::try_to_lock);
+    if (!lock.owns_lock()) return Status(ErrorCode::Busy, "a generation is already running on this engine");
+    return generate_locked(prompt, params, on_token, nullptr);
+}
+
+Result<GenerationStats> Engine::generate_locked(std::span<const int32_t> prompt, const SamplingParams& params,
+                                                const TokenCallback& on_token, const std::string_view* text,
+                                                const ForceCallback* force) {
+    if (prompt.empty()) return Status(ErrorCode::InvalidArgument, "empty prompt");
+    if (params.max_tokens <= 0) return Status(ErrorCode::InvalidArgument, "max_tokens must be positive");
+
+    const auto t_start = Clock::now();
+    Impl& s = *impl_;
+    s.cancel.store(false, std::memory_order_relaxed);
+    const PowerManager::Work thermal(*s.power);  // thermal sampling while this runs
+    // The last prompt token seeds the decode loop, so it is never reused.
+    const size_t reused = s.reuse_prefix(prompt, prompt.size() - 1);
+    if (s.speculative) s.speculative->reset_stats();
+    s.power->reset_pacing();
+    {
+        // The caller decodes too, and may be a different OS thread each run
+        // (a Dart isolate moves between threads).
+        std::vector<int32_t> decode_threads = s.pool->worker_thread_ids();
+        decode_threads.push_back(ThreadPool::current_thread_id());
+        s.power->set_hint_threads(std::move(decode_threads));
+    }
+    Sampler sampler(params);
+    GenerationStats stats;
+    const TripleBufferLoader::Stats loader_before =
+        s.weight_loader ? s.weight_loader->stats() : TripleBufferLoader::Stats{};
+    stats.prompt_tokens = static_cast<int32_t>(prompt.size());
+    const ExpertStore::Stats experts_before =
+        s.target->expert_store() != nullptr ? s.target->expert_store()->stats() : ExpertStore::Stats{};
+    const Transformer::ExpertPredictions predictions_before = s.target->expert_predictions();
+
+    // Prefill everything but the last prompt token, which seeds the decode
+    // loop (the speculative decoder expects it uncached).
+    const auto t_prefill = Clock::now();
+    stats.context_ms = std::chrono::duration<double, std::milli>(t_prefill - t_start).count();
+    size_t first_uncached = reused;
+    stats.cached_prefix_tokens = static_cast<int32_t>(reused);
+#if defined(LIYAB_ENABLE_EXPERIMENTAL)
+    // Persistent prefix cache: attach snapshotted KV pages for the longest
+    // known prefix (full attention, no draft model).
+    // (Not for hybrid models: the snapshots hold KV pages, not recurrent states.)
+    const bool use_dedup = reused == 0 && s.kv_dedup && !s.draft && s.target->kv_cache().window() == 0 &&
+                           !s.target->config().hybrid();
+    if (use_dedup) {
+        const int32_t restored = s.kv_dedup->restore(prompt, static_cast<int32_t>(prompt.size()) - 1,
+                                                     s.target->mutable_kv_cache());
+        if (restored > 0 && s.target->adopt_cached_prefix(restored).is_ok()) {
+            first_uncached = static_cast<size_t>(restored);
+            stats.cached_prefix_tokens = restored;
+            s.context.assign(prompt.begin(), prompt.begin() + restored);
+        } else {
+            s.clear_context();
+        }
+    }
+#endif
+    const PowerPolicy prefill_policy = s.power->policy();
+    s.apply_policy(prefill_policy);
+    const Route prefill_route = prefill_policy.throttled ? s.throttled_route() : s.normal_route();
+    const ForwardHooks prefill_hooks = s.hooks(prefill_policy, false);
+    const auto chunk = static_cast<size_t>(s.prefill_chunk());
+    const std::span<const int32_t> prefix = prompt.first(prompt.size() - 1).subspan(first_uncached);
+    for (size_t i = 0; i < prefix.size(); i += chunk) {
+        if (s.cancel.load(std::memory_order_relaxed)) {
+            stats.cancelled = true;
+            return stats;
+        }
+        const auto part = prefix.subspan(i, std::min(chunk, prefix.size() - i));
+        if (auto r = s.target->forward(part, Transformer::Logits::None, prefill_route, *s.pool, &prefill_hooks); !r) {
+            s.clear_context();
+            return r.status();
+        }
+        if (s.draft) {
+            if (auto r = s.draft->forward(part, Transformer::Logits::None, s.draft_route(), *s.pool); !r) {
+                s.clear_context();
+                return r.status();
+            }
+        } else {
+            s.context.insert(s.context.end(), part.begin(), part.end());
+        }
+    }
+    stats.prefill_ms = ms_since(t_prefill);
+    // The next chat turn re-sends this prompt: keep its recurrent state.
+    if (!s.draft) s.target->snapshot_state(/*pin=*/true);
+#if defined(LIYAB_ENABLE_EXPERIMENTAL)
+    if (use_dedup) {
+        auto saved = s.kv_dedup->save(prompt, static_cast<int32_t>(prompt.size()) - 1, s.target->kv_cache());
+        if (!saved) LIYAB_LOG_WARN("KV snapshot not saved: %s", saved.status().to_string().c_str());
+    }
+#endif
+
+    const auto t_decode = Clock::now();
+    const Transformer::PhaseTimes phases_before = s.target->phase_times();
+    std::string pending_utf8;
+    std::string generated;  // the output so far, kept for `force`
+    std::vector<float> probs;
+    int32_t last = prompt.back();
+    bool stop = false;
+    std::chrono::microseconds idle{0};
+
+    while (!stop) {
+        if (s.cancel.load(std::memory_order_relaxed)) {
+            stats.cancelled = true;
+            break;
+        }
+        const PowerPolicy policy = s.power->policy();
+        s.apply_policy(policy);
+        const Route route = policy.throttled ? s.throttled_route() : s.normal_route();
+        if (policy.throttled) ++stats.thermal_reroutes;
+
+        std::vector<int32_t> next;
+        if (s.speculative) {
+            auto r = s.speculative->step(last, s.context, sampler, route, s.draft_route(), *s.pool);
+            if (!r) {
+                s.clear_context();
+                return r.status();
+            }
+            next = std::move(r).value();
+            if (!s.draft) {  // the target now caches `last` and every returned token but the final one
+                s.context.push_back(last);
+                s.context.insert(s.context.end(), next.begin(), next.end() - 1);
+            }
+        } else {
+            const ForwardHooks hooks = s.hooks(policy, true);
+            auto logits =
+                s.target->forward(std::span<const int32_t>(&last, 1), Transformer::Logits::Last, route, *s.pool, &hooks);
+            if (!logits) {
+                s.clear_context();
+                return logits.status();
+            }
+            s.context.push_back(last);
+            if (hooks.head_mask != nullptr) ++stats.head_pruned_steps;
+            stats.ffn_blocks_skipped += s.target->last_ffn_skips();
+            if (hooks.ffn_matmul != nullptr) ++stats.sparse_ffn_steps;
+            if (const int32_t exit_layer = s.target->last_exit_layer(); exit_layer >= 0) {
+                ++stats.early_exits;
+                stats.early_exit_layers_skipped += s.target->config().n_layers - 1 - exit_layer;
+            }
+            sampler.probabilities(*logits, probs);
+            next.push_back(sampler.greedy() ? Sampler::argmax(probs) : sampler.sample(probs));
+        }
+
+        if (stats.ttft_ms == 0.0) {
+            stats.ttft_ms = ms_since(t_prefill);
+            if (const ExpertStore* store = s.target->expert_store()) {
+                stats.ttft_stall_ms = store->stats().stall_ms - experts_before.stall_ms;
+            }
+        }
+        for (const int32_t token : next) {
+            if (s.tokenizer->is_end_of_generation(token)) {
+                stop = true;
+                break;
+            }
+            // Duty cycling: hold this token until its slot at the target
+            // rate; the SoC idles in between instead of racing ahead.
+            idle += s.power->pace_token();
+            ++stats.generated_tokens;
+            s.tokens_generated.fetch_add(1, std::memory_order_relaxed);
+            pending_utf8 += s.tokenizer->piece(token);
+            const size_t ready = complete_utf8_prefix(pending_utf8);
+            if (ready > 0) {
+                const bool keep_going = on_token ? on_token(std::string_view(pending_utf8).substr(0, ready), token) : true;
+                if (force != nullptr) generated.append(pending_utf8, 0, ready);
+                pending_utf8.erase(0, ready);
+                if (!keep_going) {
+                    stop = true;
+                    break;
+                }
+            }
+            if (stats.generated_tokens >= params.max_tokens || s.cancel.load(std::memory_order_relaxed)) {
+                stats.cancelled = s.cancel.load(std::memory_order_relaxed);
+                stop = true;
+                break;
+            }
+        }
+        last = next.back();
+
+        // Forced continuation (structured output): text the caller requires
+        // next (a tool call's fixed syntax, a name it completes) goes through
+        // the model in one batched pass with the token just sampled, at a
+        // fraction of decoding it token by token, and is emitted as output.
+        if (!stop && force != nullptr && !s.speculative && pending_utf8.empty()) {
+            const std::string forced = (*force)(generated);
+            if (!forced.empty()) {
+                auto forced_tokens = s.tokenizer->encode(forced, false);
+                if (forced_tokens && !forced_tokens->empty()) {
+                    std::vector<int32_t> batch{last};
+                    batch.insert(batch.end(), forced_tokens->begin(), forced_tokens->end() - 1);
+                    const ForwardHooks hooks = s.hooks(policy, false);
+                    const auto t_forced = Clock::now();
+                    if (auto r = s.target->forward(batch, Transformer::Logits::None, route, *s.pool, &hooks); !r) {
+                        s.clear_context();
+                        return r.status();
+                    }
+                    stats.forced_ms += ms_since(t_forced);
+                    s.context.insert(s.context.end(), batch.begin(), batch.end());
+                    last = forced_tokens->back();
+                    stats.forced_tokens += static_cast<int32_t>(forced_tokens->size());
+                    generated += forced;
+                    if (on_token && !on_token(forced, last)) stop = true;
+                }
+            }
+        }
+    }
+    if (!pending_utf8.empty() && on_token) on_token(pending_utf8, last);
+
+    stats.decode_ms = ms_since(t_decode);
+    stats.tokens_per_second = stats.decode_ms > 0.0 ? stats.generated_tokens * 1000.0 / stats.decode_ms : 0.0;
+    stats.paced_idle_ms = static_cast<double>(idle.count()) / 1000.0;
+    if (s.weight_loader) {
+        const TripleBufferLoader::Stats after = s.weight_loader->stats();
+        stats.weight_stalls = static_cast<int32_t>(after.stalls - loader_before.stalls);
+        stats.weight_wait_ms = after.consumer_wait_ms - loader_before.consumer_wait_ms;
+    }
+    stats.kv_cache_bytes = s.target->kv_cache().bytes_in_use();
+    if (const ExpertStore* store = s.target->expert_store()) {
+        const ExpertStore::Stats after = store->stats();
+        stats.expert_hits = static_cast<int32_t>(after.hits - experts_before.hits);
+        stats.expert_late = static_cast<int32_t>(after.late - experts_before.late);
+        stats.expert_misses = static_cast<int32_t>(after.misses - experts_before.misses);
+        stats.expert_bytes_read = after.bytes_read - experts_before.bytes_read;
+        stats.expert_stall_ms = after.stall_ms - experts_before.stall_ms;
+        stats.expert_unused = static_cast<int32_t>(after.unused - experts_before.unused);
+        stats.expert_dropped = static_cast<int32_t>(after.dropped - experts_before.dropped);
+        const Transformer::ExpertPredictions& predictions = s.target->expert_predictions();
+        stats.expert_skipped = static_cast<int32_t>(predictions.skipped - predictions_before.skipped);
+        stats.expert_predicted = static_cast<int32_t>(predictions.predicted - predictions_before.predicted);
+        stats.expert_predicted_used = static_cast<int32_t>(predictions.used - predictions_before.used);
+    }
+    const Transformer::PhaseTimes& phases = s.target->phase_times();
+    stats.decode_phases = {phases.attention - phases_before.attention,
+                           phases.delta_net - phases_before.delta_net,
+                           phases.router - phases_before.router,
+                           phases.experts - phases_before.experts,
+                           phases.shared_expert - phases_before.shared_expert,
+                           phases.dense_ffn - phases_before.dense_ffn,
+                           phases.lm_head - phases_before.lm_head};
+    if (s.speculative) {
+        stats.draft_tokens_proposed = s.speculative->proposed();
+        stats.draft_tokens_accepted = s.speculative->accepted();
+    }
+    if (text != nullptr && !s.draft) s.remember_text(prompt, *text);
+    return stats;
+}
+
+}  // namespace liyab

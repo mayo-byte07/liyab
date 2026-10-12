@@ -1,0 +1,15 @@
+# Build outputs
+build/
+build-*/
+*.xcframework
+
+# IDE / tooling
+.cache/
+compile_commands.json
+.DS_Store
+
+# Models are never committed
+*.gguf
+
+# Python bytecode (scripts importing scripts/)
+__pycache__/

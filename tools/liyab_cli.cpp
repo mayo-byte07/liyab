@@ -1,0 +1,391 @@
+// liyab-cli — command-line front end over the C ABI (the same surface that
+// JNI and Swift use). Useful for on-device testing over `adb shell`.
+//
+//   liyab-cli --device
+//   liyab-cli -m model.gguf -p "Once upon a time" [-n 128] [--temp 0.8]
+//             [--then TEXT]... [--json]
+//             [--draft draft.gguf] [--profile performance|balanced|low_power]
+//             [--backend auto|cpu|metal|vulkan] [--kv f16|q8_0|q4_0|q4_1] [--ctx N]
+//             [--window N] [--threads N] [--seed N]
+#include <algorithm>
+#include <chrono>
+#include <csignal>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <string>
+#include <string_view>
+#include <vector>
+
+#include <sys/resource.h>
+
+#include "liyab/liyab_c_api.h"
+
+namespace {
+
+liyab_engine* g_engine = nullptr;
+
+void on_sigint(int) {
+    if (g_engine != nullptr) liyab_engine_cancel(g_engine);  // async-signal-safe: sets an atomic flag
+}
+
+// One turn's reply, collected piece by piece; echoed as it streams unless the
+// output is JSON.
+struct Reply {
+    std::string text;
+    bool echo = true;
+};
+
+int32_t on_piece(const char* piece, size_t len, int32_t, void* user) {
+    auto* reply = static_cast<Reply*>(user);
+    reply->text.append(piece, len);
+    if (reply->echo) {
+        std::fwrite(piece, 1, len, stdout);
+        std::fflush(stdout);
+    }
+    return 1;
+}
+
+// The process's peak resident memory in MiB. ru_maxrss counts KiB on Linux
+// and Android, bytes on Apple platforms.
+double peak_rss_mib() {
+    rusage usage{};
+    if (getrusage(RUSAGE_SELF, &usage) != 0) return 0.0;
+#if defined(__APPLE__)
+    return static_cast<double>(usage.ru_maxrss) / (1024.0 * 1024.0);
+#else
+    return static_cast<double>(usage.ru_maxrss) / 1024.0;
+#endif
+}
+
+// `s` as a JSON string. Replies are whole UTF-8 (the C API never splits a
+// character), which JSON carries as is; only quotes, backslashes and control
+// characters need escapes.
+std::string json_string(std::string_view s) {
+    std::string out = "\"";
+    for (const char c : s) {
+        switch (c) {
+            case '"': out += "\\\""; break;
+            case '\\': out += "\\\\"; break;
+            case '\n': out += "\\n"; break;
+            case '\r': out += "\\r"; break;
+            case '\t': out += "\\t"; break;
+            default:
+                if (static_cast<unsigned char>(c) < 0x20) {
+                    char escaped[8];
+                    std::snprintf(escaped, sizeof escaped, "\\u%04x", static_cast<unsigned>(c));
+                    out += escaped;
+                } else {
+                    out += c;
+                }
+        }
+    }
+    return out + "\"";
+}
+
+// The human-readable summary of one generation, on stderr.
+void print_stats(const liyab_generation_stats& stats) {
+    std::fprintf(stderr,
+                 "\nprompt %d tok (%d reused) in %.1f ms (TTFT %.1f ms) | %d tok in %.1f ms = %.2f tok/s | paced idle "
+                 "%.1f ms%s\n",
+                 stats.prompt_tokens, stats.cached_prefix_tokens, stats.prefill_ms, stats.ttft_ms,
+                 stats.generated_tokens, stats.decode_ms, stats.tokens_per_second, stats.paced_idle_ms,
+                 stats.cancelled ? " | cancelled" : "");
+    if (stats.draft_tokens_proposed > 0) {
+        std::fprintf(stderr, "speculative: %d/%d draft tokens accepted (%.0f%%)\n", stats.draft_tokens_accepted,
+                     stats.draft_tokens_proposed, 100.0 * stats.draft_tokens_accepted / stats.draft_tokens_proposed);
+    }
+    if (stats.thermal_reroutes > 0) std::fprintf(stderr, "thermal reroutes: %d steps\n", stats.thermal_reroutes);
+    if (stats.early_exits > 0) {
+        std::fprintf(stderr, "early exits: %d steps, %d blocks skipped\n", stats.early_exits,
+                     stats.early_exit_layers_skipped);
+    }
+    std::fprintf(stderr, "KV cache: %.1f MiB in use | peak RSS %.0f MiB\n",
+                 static_cast<double>(stats.kv_cache_bytes) / (1024.0 * 1024.0), peak_rss_mib());
+    if (stats.weight_stalls > 0) {
+        std::fprintf(stderr, "weight stalls: %d (%.1f ms waiting for storage)\n", stats.weight_stalls,
+                     stats.weight_wait_ms);
+    }
+    if (stats.ffn_blocks_skipped > 0) {
+        std::fprintf(stderr, "EGLS: %d FFN blocks skipped (%.1f per token)\n", stats.ffn_blocks_skipped,
+                     static_cast<double>(stats.ffn_blocks_skipped) / std::max(1, stats.generated_tokens));
+    }
+    if (const int32_t used = stats.expert_hits + stats.expert_late + stats.expert_misses; used > 0) {
+        std::fprintf(stderr,
+                     "experts: %d used, %.0f%% cached, %.0f%% prefetched late, %.0f%% missed; %.1f MiB/token read, "
+                     "%.0f ms waiting (%.0f%% of decode)\n",
+                     used, 100.0 * stats.expert_hits / used, 100.0 * stats.expert_late / used,
+                     100.0 * stats.expert_misses / used,
+                     static_cast<double>(stats.expert_bytes_read) / (1024.0 * 1024.0) /
+                         std::max(1, stats.prompt_tokens + stats.generated_tokens),
+                     stats.expert_stall_ms, 100.0 * stats.expert_stall_ms / std::max(1.0, stats.prefill_ms + stats.decode_ms));
+    }
+    if (stats.expert_predicted > 0) {
+        std::fprintf(stderr,
+                     "experts: prediction precision %.0f%% (%d of %d guesses chosen); wrong guesses: %d dropped "
+                     "before reading, %d read and evicted unused; %d slow experts skipped\n",
+                     100.0 * stats.expert_predicted_used / stats.expert_predicted, stats.expert_predicted_used,
+                     stats.expert_predicted, stats.expert_dropped, stats.expert_unused, stats.expert_skipped);
+    }
+    if (stats.expert_unused > 0) {
+        std::fprintf(stderr, "experts: %d prefetched and evicted unused (%.1f per token)\n", stats.expert_unused,
+                     static_cast<double>(stats.expert_unused) / std::max(1, stats.prompt_tokens + stats.generated_tokens));
+    }
+    if (stats.generated_tokens > 0 && stats.decode_ms > 0.0) {
+        // Decode time per token by phase; "other" is norms, residuals, sampling and callbacks.
+        const double per = 1.0 / stats.generated_tokens;
+        const double phases[] = {stats.attention_ms, stats.delta_net_ms, stats.router_ms, stats.experts_ms,
+                                 stats.shared_expert_ms, stats.dense_ffn_ms, stats.lm_head_ms};
+        const char* names[] = {"attention", "DeltaNet", "router", "experts", "shared expert", "dense FFN", "LM head"};
+        double timed = 0.0;
+        std::fprintf(stderr, "decode ms/token:");
+        for (size_t i = 0; i < sizeof phases / sizeof phases[0]; ++i) {
+            timed += phases[i];
+            if (phases[i] > 0.0) std::fprintf(stderr, " %s %.1f |", names[i], phases[i] * per);
+        }
+        std::fprintf(stderr, " other %.1f | total %.1f\n", (stats.decode_ms - timed) * per, stats.decode_ms * per);
+    }
+    if (stats.sparse_ffn_steps > 0) std::fprintf(stderr, "TDSS: %d steps on 2:4 sparse FFN\n", stats.sparse_ffn_steps);
+    if (stats.head_pruned_steps > 0) std::fprintf(stderr, "head pruning: %d steps\n", stats.head_pruned_steps);
+}
+
+// One generation as a JSON line on stdout (--json): the stats scripts compare
+// across builds, the peak memory so far and the reply.
+void print_json_turn(int turn, const liyab_generation_stats& s, const std::string& text) {
+    std::printf(
+        "{\"turn\":%d,\"prompt_tokens\":%d,\"cached_prefix_tokens\":%d,\"prefill_ms\":%.3f,\"ttft_ms\":%.3f,"
+        "\"generated_tokens\":%d,\"forced_tokens\":%d,\"decode_ms\":%.3f,\"tokens_per_second\":%.3f,"
+        "\"paced_idle_ms\":%.3f,\"thermal_reroutes\":%d,\"cancelled\":%s,\"kv_cache_bytes\":%llu,"
+        "\"expert_hits\":%d,\"expert_late\":%d,\"expert_misses\":%d,\"expert_bytes_read\":%llu,"
+        "\"expert_stall_ms\":%.3f,\"phases_ms\":{\"attention\":%.3f,\"delta_net\":%.3f,\"router\":%.3f,"
+        "\"experts\":%.3f,\"shared_expert\":%.3f,\"dense_ffn\":%.3f,\"lm_head\":%.3f},\"peak_rss_mib\":%.1f,"
+        "\"text\":%s}\n",
+        turn, s.prompt_tokens, s.cached_prefix_tokens, s.prefill_ms, s.ttft_ms, s.generated_tokens, s.forced_tokens,
+        s.decode_ms, s.tokens_per_second, s.paced_idle_ms, s.thermal_reroutes, s.cancelled ? "true" : "false",
+        static_cast<unsigned long long>(s.kv_cache_bytes), s.expert_hits, s.expert_late, s.expert_misses,
+        static_cast<unsigned long long>(s.expert_bytes_read), s.expert_stall_ms, s.attention_ms, s.delta_net_ms,
+        s.router_ms, s.experts_ms, s.shared_expert_ms, s.dense_ffn_ms, s.lm_head_ms, peak_rss_mib(),
+        json_string(text).c_str());
+    std::fflush(stdout);
+}
+
+void usage() {
+    std::fprintf(stderr,
+                 "usage: liyab-cli --device\n"
+                 "       liyab-cli -m MODEL.gguf -p PROMPT [options]\n"
+                 "options:\n"
+                 "  --tokenize         print the prompt's token ids and exit\n"
+                 "  -n N               max new tokens (default 128), per turn\n"
+                 "  --then TEXT        a follow-up turn (repeatable): its prompt is the previous prompt, the\n"
+                 "                     reply to it and TEXT, so the engine reuses its context as in a chat\n"
+                 "  --json             stdout: one JSON line after loading (load_ms, context, memory plan)\n"
+                 "                     and one per turn (stats, peak RSS, reply) instead of the text\n"
+                 "  --temp T           temperature, 0 = greedy (default 0.8)\n"
+                 "  --top-k K          (default 40)    --top-p P (default 0.95)\n"
+                 "  --seed N           RNG seed (default random)\n"
+                 "  --draft PATH       draft model for speculative decoding\n"
+                 "  --draft-tokens K   tokens per speculative step (default 3)\n"
+                 "  --lookup           speculative decoding without a draft model: drafts from the\n"
+                 "                     conversation (n-gram lookup)\n"
+                 "  --fixed-drafts     always verify --draft-tokens drafts (default: learned per device)\n"
+                 "  --profile P        performance | balanced | low_power (default balanced)\n"
+                 "  --tps R            override the paced token rate\n"
+                 "  --skin-threshold C thermal throttle threshold in °C (default 40)\n"
+                 "  --backend B        auto | cpu | metal | vulkan (default auto)\n"
+                 "  --kv T             f16 | q8_0 | q4_0 | q4_1 (default q8_0)\n"
+                 "  --ctx N            context length    --window N  sliding window\n"
+                 "  --sinks N          attention-sink tokens kept with --window (default 8)\n"
+                 "  --triple-buffer    stream blocks through 3 rotating buffers (bounded memory)\n"
+                 "  --expert-cache MB  MoE: RAM for streamed experts (-1 auto, 0 off; default auto)\n"
+                 "  --memory-budget MB cap on resident memory (weights + caches); default: free RAM\n"
+                 "  --requant 4|5|-1   MoE expert streaming: resident Q8_0 matrices to Q4_K / Q5_K at\n"
+                 "                     load (lossy, fewer bytes per token; default off); -1: only when\n"
+                 "                     the expert cache would hold under 10%% of the experts (the app's default)\n"
+                 "  --expert-mass P    MoE: run only the top experts covering router mass P\n"
+                 "                     (lossy, e.g. 0.9; default 1 = all top-k)\n"
+                 "  --experts N        MoE: at most N experts per token (lossy; default: the model's)\n"
+                 "  --skip-slow W      MoE streaming: skip a chosen expert not yet in RAM whose router weight\n"
+                 "                     share is below W (e.g. 0.1) for every token using it (lossy; default 0)\n"
+                 "  --prefix-cache MB  keep contexts replaced by an unrelated prompt in an in-RAM LRU of\n"
+                 "                     at most this size, restored when a later prompt continues one; with\n"
+                 "                     --memory-budget, MoE streaming gives it only what the expert cache\n"
+                 "                     can spare above 10%% of the experts (default 0)\n"
+                 "  --prefix-cache-disk MB DIR  keep such contexts that RAM does not hold in files in DIR,\n"
+                 "                     up to MB of storage (default 0: off)\n"
+                 "  --threads N        worker threads (default: performance cores, minus one\n"
+                 "                     when every core is a performance core)\n"
+                 "experimental (LIYAB_ENABLE_EXPERIMENTAL=ON builds):\n"
+                 "  --early-exit P     exit early when token confidence > P (e.g. 0.98)\n"
+                 "  --prune-heads R    keep ratio R of attention heads when hot / low power\n"
+                 "  --egls T           skip a block's FFN when its entropy delta < T (e.g. 0.002)\n"
+                 "  --tdss hot|always  2:4 sparse FFN weights while throttled, or always\n"
+                 "  --kv-dedup DIR     persistent prefix KV cache (reuse system-prompt KV across runs)\n");
+}
+
+}  // namespace
+
+int main(int argc, char** argv) {
+    liyab_engine_config config;
+    liyab_engine_config_default(&config);
+    liyab_sampling_params params;
+    liyab_sampling_params_default(&params);
+    params.max_tokens = 128;
+    std::string prompt;
+    std::vector<std::string> follow_ups;  // --then
+    bool device_only = false;
+    bool tokenize_only = false;
+    bool json = false;
+
+    for (int i = 1; i < argc; ++i) {
+        const std::string arg = argv[i];
+        auto next = [&]() -> const char* {
+            if (i + 1 >= argc) {
+                std::fprintf(stderr, "missing value for %s\n", arg.c_str());
+                std::exit(2);
+            }
+            return argv[++i];
+        };
+        if (arg == "--device") device_only = true;
+        else if (arg == "--tokenize") tokenize_only = true;
+        else if (arg == "-m" || arg == "--model") config.model_path = next();
+        else if (arg == "-p" || arg == "--prompt") prompt = next();
+        else if (arg == "--then") follow_ups.emplace_back(next());
+        else if (arg == "--json") json = true;
+        else if (arg == "-n") params.max_tokens = std::atoi(next());
+        else if (arg == "--temp") params.temperature = static_cast<float>(std::atof(next()));
+        else if (arg == "--top-k") params.top_k = std::atoi(next());
+        else if (arg == "--top-p") params.top_p = static_cast<float>(std::atof(next()));
+        else if (arg == "--seed") params.seed = std::strtoull(next(), nullptr, 10);
+        else if (arg == "--draft") config.draft_model_path = next();
+        else if (arg == "--draft-tokens") config.draft_tokens = std::atoi(next());
+        else if (arg == "--lookup") config.lookup_drafts = true;
+        else if (arg == "--fixed-drafts") config.adaptive_drafts = false;
+        else if (arg == "--tps") config.target_tps = std::atof(next());
+        else if (arg == "--skin-threshold") config.skin_threshold_c = static_cast<float>(std::atof(next()));
+        else if (arg == "--ctx") config.context_length = std::atoi(next());
+        else if (arg == "--window") config.sliding_window = std::atoi(next());
+        else if (arg == "--sinks") config.kv_sink_tokens = std::atoi(next());
+        else if (arg == "--triple-buffer") config.triple_buffer_loading = 1;
+        else if (arg == "--expert-cache") config.expert_cache_mb = std::atoll(next());
+        else if (arg == "--memory-budget") config.memory_budget_mb = std::atoll(next());
+        else if (arg == "--requant") config.requant_bits = std::atoi(next());
+        else if (arg == "--expert-mass") config.moe_expert_mass = static_cast<float>(std::atof(next()));
+        else if (arg == "--experts") config.moe_max_experts = std::atoi(next());
+        else if (arg == "--skip-slow") config.moe_skip_slow = static_cast<float>(std::atof(next()));
+        else if (arg == "--prefix-cache") config.prefix_cache_mb = std::atoll(next());
+        else if (arg == "--prefix-cache-disk") {
+            config.prefix_cache_disk_mb = std::atoll(next());
+            config.prefix_cache_dir = next();
+        }
+        else if (arg == "--threads") config.n_threads = std::atoi(next());
+        else if (arg == "--early-exit") {
+            config.early_exit = 1;
+            config.early_exit_threshold = static_cast<float>(std::atof(next()));
+        } else if (arg == "--egls") {
+            config.egls = 1;
+            config.egls_threshold = static_cast<float>(std::atof(next()));
+        } else if (arg == "--kv-dedup") {
+            config.kv_dedup_dir = next();
+        } else if (arg == "--tdss") {
+            const std::string v = next();
+            config.tdss = v == "always" ? 2 : 1;
+        } else if (arg == "--prune-heads") {
+            config.head_pruning = 1;
+            config.head_keep_ratio = static_cast<float>(std::atof(next()));
+        }
+        else if (arg == "--profile") {
+            const std::string v = next();
+            if (v == "performance") config.power_profile = LIYAB_POWER_PERFORMANCE;
+            else if (v == "balanced") config.power_profile = LIYAB_POWER_BALANCED;
+            else if (v == "low_power") config.power_profile = LIYAB_POWER_LOW_POWER;
+            else return usage(), 2;
+        } else if (arg == "--backend") {
+            const std::string v = next();
+            if (v == "auto") config.backend = LIYAB_BACKEND_AUTO;
+            else if (v == "cpu") config.backend = LIYAB_BACKEND_CPU;
+            else if (v == "metal") config.backend = LIYAB_BACKEND_METAL;
+            else if (v == "vulkan") config.backend = LIYAB_BACKEND_VULKAN;
+            else return usage(), 2;
+        } else if (arg == "--kv") {
+            const std::string v = next();
+            if (v == "f16") config.kv_cache_type = LIYAB_KV_F16;
+            else if (v == "q8_0") config.kv_cache_type = LIYAB_KV_Q8_0;
+            else if (v == "q4_0") config.kv_cache_type = LIYAB_KV_Q4_0;
+            else if (v == "q4_1") config.kv_cache_type = LIYAB_KV_Q4_1;
+            else return usage(), 2;
+        } else if (arg == "-h" || arg == "--help") {
+            usage();
+            return 0;
+        } else {
+            std::fprintf(stderr, "unknown argument: %s\n", arg.c_str());
+            usage();
+            return 2;
+        }
+    }
+
+    std::fprintf(json ? stderr : stdout, "liyab %s\n", liyab_version());  // --json: stdout is JSON lines only
+    if (device_only) {
+        std::string text(liyab_describe_device(nullptr, 0) + 1, '\0');
+        liyab_describe_device(text.data(), text.size());
+        std::printf("%s", text.c_str());
+        return 0;
+    }
+    if (config.model_path == nullptr || prompt.empty()) {
+        usage();
+        return 2;
+    }
+
+    const auto t_load = std::chrono::steady_clock::now();
+    if (liyab_engine_create(&config, &g_engine) != LIYAB_OK) {
+        std::fprintf(stderr, "error: %s\n", liyab_last_error());
+        return 1;
+    }
+    const double load_ms =
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_load).count();
+    if (tokenize_only) {
+        const int32_t n = liyab_engine_tokenize(g_engine, prompt.c_str(), params.add_bos, nullptr, 0);
+        std::vector<int32_t> ids(static_cast<size_t>(std::max(0, n)));
+        liyab_engine_tokenize(g_engine, prompt.c_str(), params.add_bos, ids.data(), n);
+        for (size_t i = 0; i < ids.size(); ++i) std::printf("%s%d", i ? " " : "", ids[i]);
+        std::printf("\n");
+        liyab_engine_destroy(g_engine);
+        return n < 0 ? 1 : 0;
+    }
+    std::string info(liyab_engine_describe(g_engine, nullptr, 0) + 1, '\0');
+    liyab_engine_describe(g_engine, info.data(), info.size());
+    std::fprintf(stderr, "%s\nloaded in %.0f ms\n", info.c_str(), load_ms);
+    if (json) {
+        liyab_memory_plan plan{};
+        liyab_engine_memory_plan(g_engine, &plan);
+        std::printf("{\"load_ms\":%.3f,\"context_length\":%d,\"expert_cache_bytes\":%llu,\"requant_bits\":%d,"
+                    "\"peak_rss_mib\":%.1f}\n",
+                    load_ms, liyab_engine_context_length(g_engine),
+                    static_cast<unsigned long long>(plan.expert_cache_bytes), plan.requant_bits, peak_rss_mib());
+        std::fflush(stdout);
+    }
+
+    std::signal(SIGINT, on_sigint);
+    // Each follow-up continues the text the engine processed, as a chat does:
+    // the previous prompt, the reply to it, then the new turn.
+    std::string turn_prompt = prompt;
+    liyab_status status = LIYAB_OK;
+    for (size_t turn = 0; turn <= follow_ups.size(); ++turn) {
+        Reply reply;
+        reply.echo = !json;
+        if (!json) std::printf("%s", turn == 0 ? prompt.c_str() : follow_ups[turn - 1].c_str());
+        liyab_generation_stats stats{};
+        status = liyab_engine_generate(g_engine, turn_prompt.c_str(), &params, on_piece, &reply, &stats);
+        if (!json) std::printf("\n");
+        if (status != LIYAB_OK) {
+            std::fprintf(stderr, "error: %s\n", liyab_last_error());
+            break;
+        }
+        print_stats(stats);
+        if (json) print_json_turn(static_cast<int>(turn) + 1, stats, reply.text);
+        if (stats.cancelled) break;
+        if (turn < follow_ups.size()) turn_prompt += reply.text + follow_ups[turn];
+    }
+    liyab_engine_destroy(g_engine);
+    g_engine = nullptr;
+    return status == LIYAB_OK ? 0 : 1;
+}
